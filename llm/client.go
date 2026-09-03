@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/NachiketKandari/pr-review-agent/xlog"
 )
 
 const defaultTimeout = 7200 * time.Second
@@ -80,16 +82,18 @@ func New(opts Options) (*Client, error) {
 		timeout = defaultTimeout
 	}
 
+	transport := &http.Transport{
+		Proxy:           proxy,
+		TLSClientConfig: tlsCfg,
+	}
+
 	return &Client{
 		baseURL: base,
 		apiKey:  opts.APIKey,
 		headers: opts.Headers,
 		http: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				Proxy:           proxy,
-				TLSClientConfig: tlsCfg,
-			},
+			Timeout:   timeout,
+			Transport: logTransport{base: transport},
 		},
 	}, nil
 }
@@ -143,5 +147,32 @@ func checkStatus(resp *http.Response) error {
 		msg = apiErr.Error.Message
 	}
 
-	return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, resp.Request.URL, msg)
+	return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, xlog.SafeURL(resp.Request.URL.String()), msg)
+}
+
+// logTransport emits Debug-level records for every HTTP round trip with the
+// URL sanitized (query strings, fragments, and userinfo stripped) so that
+// credentials embedded in URLs or headers never reach the log. Response
+// bodies and headers are never logged.
+type logTransport struct {
+	base http.RoundTripper
+}
+
+func (t logTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := t.base.RoundTrip(req)
+	attrs := []any{
+		"method", req.Method,
+		"url", xlog.SafeURL(req.URL.String()),
+		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		xlog.Debug("llm request failed", append(attrs, "error", err)...)
+		return nil, err
+	}
+	if resp != nil {
+		attrs = append(attrs, "status", resp.StatusCode)
+	}
+	xlog.Debug("llm request complete", attrs...)
+	return resp, err
 }

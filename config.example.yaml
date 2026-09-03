@@ -2,8 +2,29 @@ name: Local Config
 version: 1.0.0
 schema: v1
 models:
-  - name: vLLM qwen3-VL-30B-A3B
-    provider: openai
-    model: /opt/vllm/models/qwen3-VL-30B-A3B-Instruct-AWQ
-    apiBase: http://localhost:8000/v1
-    apiKey: dummy
+  - name: DeepSeek V4 Flash
+    provider: deepseek
+    model: deepseek-v4-flash
+    apiBase: https://api.deepseek.com/v1
+    apiKey: sk-your-key
+
+# Optional: review-mode settings. All keys are optional; omitted ones use
+# the built-in defaults (see README).
+review:
+  model: deepseek-v4-flash     # optional override; else -model flag, else first model
+  systemPrompt: |
+    You are a senior code reviewer. Focus on correctness, security,
+    concurrency, performance, and maintainability.
+  # chunkPrompt supports {{index}} {{total}} {{files}} {{diff}} {{responseTokens}}
+  chunkPrompt: ""
+  # mergePrompt supports {{findings}}
+  mergePrompt: ""
+  maxChunkTokens: 8000
+  maxResponseTokens: 2048
+  temperature: 0.2
+
+# Optional: GitHub API access for review mode. Token is optional; the
+# GITHUB_TOKEN environment variable is also honored. Without either, only
+# public repositories can be fetched (rate-limited).
+github:
+  token: ""

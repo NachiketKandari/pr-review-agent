@@ -78,6 +78,68 @@ func TestLoadMissingFile(t *testing.T) {
 	}
 }
 
+// An old-style config without review/github sections must keep parsing
+// exactly as before (backward compatibility).
+func TestLoadBackwardCompatible(t *testing.T) {
+	cfg, err := Load(writeSample(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Review.SystemPrompt != "" || cfg.Review.MaxChunkTokens != 0 {
+		t.Errorf("review defaults leaked into old config: %+v", cfg.Review)
+	}
+	if cfg.Github.Token != "" {
+		t.Errorf("github token unexpectedly set: %q", cfg.Github.Token)
+	}
+}
+
+func TestLoadReviewAndGithubSections(t *testing.T) {
+	yaml := `name: Review Config
+version: 1.0.0
+schema: v1
+models:
+  - name: deepseek
+    provider: deepseek
+    model: deepseek-v4-flash
+    apiBase: https://api.deepseek.com/v1
+    apiKey: sk-x
+review:
+  model: deepseek-v4-flash
+  systemPrompt: |
+    Be thorough.
+  chunkPrompt: ""
+  mergePrompt: ""
+  maxChunkTokens: 4000
+  maxResponseTokens: 1024
+  temperature: 0.5
+github:
+  token: ghp_local
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Review.Model != "deepseek-v4-flash" {
+		t.Errorf("review.model = %q", cfg.Review.Model)
+	}
+	if cfg.Review.SystemPrompt != "Be thorough.\n" {
+		t.Errorf("review.systemPrompt = %q", cfg.Review.SystemPrompt)
+	}
+	if cfg.Review.MaxChunkTokens != 4000 || cfg.Review.MaxResponseTokens != 1024 {
+		t.Errorf("review token limits = %d/%d", cfg.Review.MaxChunkTokens, cfg.Review.MaxResponseTokens)
+	}
+	if cfg.Review.Temperature != 0.5 {
+		t.Errorf("review.temperature = %v", cfg.Review.Temperature)
+	}
+	if cfg.Github.Token != "ghp_local" {
+		t.Errorf("github.token = %q", cfg.Github.Token)
+	}
+}
+
 func TestModelSelection(t *testing.T) {
 	cfg, err := Load(writeSample(t))
 	if err != nil {

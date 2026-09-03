@@ -31,6 +31,29 @@ type Config struct {
 	Version string  `yaml:"version"`
 	Schema  string  `yaml:"schema"`
 	Models  []Model `yaml:"models"`
+
+	// Review configures pull-request review mode. All fields are optional
+	// and backward compatible; defaults live in the review package.
+	Review Review `yaml:"review"`
+	// Github configures GitHub API access. Token is optional; the
+	// GITHUB_TOKEN environment variable is also honored.
+	Github Github `yaml:"github"`
+}
+
+// Review holds review-mode settings. Zero values mean "use defaults".
+type Review struct {
+	Model             string  `yaml:"model"`             // optional override
+	SystemPrompt      string  `yaml:"systemPrompt"`      // "" = built-in default
+	ChunkPrompt       string  `yaml:"chunkPrompt"`       // "" = built-in default
+	MergePrompt       string  `yaml:"mergePrompt"`       // "" = built-in default
+	MaxChunkTokens    int     `yaml:"maxChunkTokens"`    // 0 = 8000
+	MaxResponseTokens int     `yaml:"maxResponseTokens"` // 0 = 2048
+	Temperature       float64 `yaml:"temperature"`       // 0 = 0.2
+}
+
+// Github holds GitHub API settings.
+type Github struct {
+	Token string `yaml:"token"` // optional; GITHUB_TOKEN env honored
 }
 
 func Load(path string) (*Config, error) {
@@ -65,6 +88,7 @@ func (c *Config) Model(selector string) (*Model, error) {
 
 	for i := range c.Models {
 		if strings.EqualFold(c.Models[i].Name, selector) ||
+			strings.EqualFold(c.Models[i].Model, selector) ||
 			strings.Contains(strings.ToLower(c.Models[i].Name), strings.ToLower(selector)) {
 			return &c.Models[i], nil
 		}
