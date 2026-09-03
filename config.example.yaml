@@ -1,0 +1,9 @@
+name: Local Config
+version: 1.0.0
+schema: v1
+models:
+  - name: vLLM qwen3-VL-30B-A3B
+    provider: openai
+    model: /opt/vllm/models/qwen3-VL-30B-A3B-Instruct-AWQ
+    apiBase: http://localhost:8000/v1
+    apiKey: dummy
