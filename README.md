@@ -79,52 +79,53 @@ to Enterprise TLS as well (corporate proxies/private CAs).
 
 The diff is obtained in this order of preference:
 
-1. **Local git clone** (default when it applies): run the tool from inside
-   a clone of the repository (or point `-repo` at one) and it fetches
-   `refs/pull/N/head` plus the default branch with git itself, then diffs
-   `merge-base(base)...head` — exactly the GitHub PR shape. Git uses its
-   own credentials (SSH key, Git Credential Manager), so **no API token is
-   needed**, which also works when your org blocks tokens with private
-   repo access.
-2. **GitHub REST API** when no matching clone is found: read-only GET
-   requests for the diff and PR metadata (Bearer auth when a token is
-   available).
-3. **`-diff file.diff`** reviews a unified diff file you exported yourself
-   (see below) and never contacts GitHub.
+1. **`.patch` link token** (for private repos whose org blocks API tokens):
+   GitHub puts a `?token=...` value on shareable `.diff`/`.patch` links of
+   private pull requests. Set `github.diffToken` (or `-diff-token`, or the
+   `GITHUB_DIFF_TOKEN` env var) to that value and the tool downloads
+   `https://<host>/<owner>/<repo>/pull/N.patch?token=...` — one request
+   that returns both the diff and the commit messages (parsed from the
+   patch headers into the review context). No API token is needed.
+2. **GitHub REST API** otherwise: read-only GET requests for the diff and
+   PR metadata (Bearer auth when a token is available).
+3. **`-diff file.diff`** reviews a unified diff or `.patch` file you
+   exported yourself (see below) and never contacts GitHub.
 
 The flow then continues: split the diff into chunks (greedy at file
 boundaries, then hunks, then lines) → review each chunk with one capped
 model call → merge findings, recursively when they overflow the context
 budget → stream the final merged review to stdout. The PR title,
-description, and commit messages (from the API or from `git log` in clone
-mode) are injected into every prompt as "Pull request intent" so the review
-knows what the change is supposed to achieve.
+description, and commit messages (from the API or from the `.patch`
+headers) are injected into every prompt as "Pull request intent" so the
+review knows what the change is supposed to achieve.
 
 **Read-only by design:** the API path only uses GET endpoints (`/pulls/N`
-diff, `/pulls/N` metadata, `/pulls/N/commits`), and the clone path runs
-read-only `git fetch`/`git diff`/`git log`. The tool can never create,
-merge, comment on, or otherwise modify anything.
+diff, `/pulls/N` metadata, `/pulls/N/commits`) and the `.patch` route is a
+single download. The tool can never create, merge, comment on, or
+otherwise modify anything.
 
-### Reviewing without an API token (blocked private-repo tokens)
+### Reviewing when API tokens for private repos are blocked
 
-If your org does not allow tokens with private repository access but you
-can still clone the repo with your normal git login, produce the diff
-yourself and review the file (or clone the repo and use `-repo`):
+If your org does not allow tokens with private repository access, use the
+shareable link token: open the private PR in your browser, click the
+`.patch` download, and copy the `token=...` value from the URL. Put it in
+`local.yaml`:
 
-```bat
-rem inside a clone of the repository (cmd.exe):
-git fetch origin refs/pull/871/head:pr-871
-git diff origin/main...pr-871 > pr-871.diff
-```
-```bat
-rem then either review the exported file:
-pr-review-agent -diff pr-871.diff "https://github.iseccorp.in/ORG/REPO/pull/871"
-rem or point the tool straight at the clone (no export needed):
-pr-review-agent -repo C:\path	oepo "https://github.iseccorp.in/ORG/REPO/pull/871"
+```yaml
+github:
+  diffToken: aBcDeF...   # the ?token= value from a private .patch/.diff link
 ```
 
-(Adjust `origin/main` to the actual base branch.) The URL is optional when
-using `-diff`; without it the tool reviews the file with no GitHub context.
+Alternatively, export the patch yourself (the browser is already logged
+in) and review the file — no GitHub access happens at all:
+
+```sh
+# save https://github.iseccorp.in/ORG/REPO/pull/871.patch as pr-871.patch
+pr-review-agent -diff pr-871.patch "https://github.iseccorp.in/ORG/REPO/pull/871"
+```
+
+The URL is optional with `-diff`; without it the tool reviews the file
+with no GitHub context.
 
 GitHub API tokens resolve in this order:
 
@@ -155,6 +156,7 @@ review:
   temperature: 0.2
 github:
   token: ""                     # optional; GITHUB_TOKEN env also honored
+  diffToken: ""                 # optional; ?token= from a private .patch/.diff link
 ```
 
 Overriding a prompt is safe: the code only warns if your custom `chunkPrompt`
@@ -179,8 +181,8 @@ to `review.systemPrompt`, which reliably stops empty responses.
 | `-timeout`     | config or 2h | request timeout, e.g. `2m`                             |
 | `-output`      | empty        | write the merged review to this file (review mode)     |
 | `-chunk-tokens`| config       | override `review.maxChunkTokens` (review mode)         |
-| `-repo`        | current dir  | local clone to diff with git instead of the API (review mode) |
-| `-diff`        | empty        | review a local unified diff file instead of fetching (review mode) |
+| `-diff`        | empty        | review a local unified diff or .patch file instead of fetching (review mode) |
+| `-diff-token`  | empty        | the ?token= value from a private .patch/.diff link (overrides github.diffToken) |
 | `-log-file`    | empty        | append structured JSON logs to this file               |
 | `-debug`       | `false`      | Info level + HTTP-level detail (sanitized URLs, status codes, durations) |
 | `-quiet`       | `false`      | errors and warnings only                               |

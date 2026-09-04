@@ -54,6 +54,11 @@ type Review struct {
 // Github holds GitHub API settings.
 type Github struct {
 	Token string `yaml:"token"` // optional; GITHUB_TOKEN env honored
+	// DiffToken is the ?token= query value GitHub puts on shareable
+	// .diff/.patch links of private pull requests. When set, the diff is
+	// downloaded from the web .patch endpoint with it instead of the REST
+	// API, which works when the org blocks API tokens for private repos.
+	DiffToken string `yaml:"diffToken"`
 }
 
 func Load(path string) (*Config, error) {

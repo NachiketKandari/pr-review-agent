@@ -114,6 +114,7 @@ review:
   temperature: 0.5
 github:
   token: ghp_local
+  diffToken: share_link_token_abc
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
@@ -137,6 +138,9 @@ github:
 	}
 	if cfg.Github.Token != "ghp_local" {
 		t.Errorf("github.token = %q", cfg.Github.Token)
+	}
+	if cfg.Github.DiffToken != "share_link_token_abc" {
+		t.Errorf("github.diffToken = %q", cfg.Github.DiffToken)
 	}
 }
 

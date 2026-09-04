@@ -161,6 +161,108 @@ func Fetch(ctx context.Context, ref Ref, token string, hc *http.Client) ([]byte,
 	return get(ctx, hc, ref, token, diffAccept, pullPath(ref), "diff")
 }
 
+// FetchPatch downloads the PR's .patch file from the web endpoint
+// https://<host>/<owner>/<repo>/pull/<N>.patch and returns the raw text
+// plus the commit subjects parsed from the patch headers. When linkToken
+// is non-empty it is appended as the ?token= query parameter that GitHub
+// puts on shareable .diff/.patch links of private pull requests; no
+// Authorization header is needed in that case. The token is never logged.
+func FetchPatch(ctx context.Context, ref Ref, linkToken string, hc *http.Client) ([]byte, []string, error) {
+	base := ""
+	if ref.Host == "" {
+		base = "https://github.com"
+	} else {
+		base = fmt.Sprintf("https://%s", ref.Host)
+	}
+	return fetchPatch(ctx, base, ref, linkToken, hc)
+}
+
+// fetchPatch is FetchPatch with an explicit web base override (tests).
+func fetchPatch(ctx context.Context, base string, ref Ref, linkToken string, hc *http.Client) ([]byte, []string, error) {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	u := fmt.Sprintf("%s/%s/%s/pull/%d.patch", strings.TrimSuffix(base, "/"), ref.Owner, ref.Repo, ref.Number)
+	if linkToken != "" {
+		u += "?token=" + url.QueryEscape(linkToken)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build patch request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	start := time.Now()
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch patch for %s: %w", ref.String(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Redirects are followed by the client; non-2xx means the patch
+		// is not accessible (wrong/expired link token, or no session).
+		_ = resp.Body
+		return nil, nil, fmt.Errorf("patch download for %s returned HTTP %d (check the diffToken/link token)", ref.String(), resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, apiMaxBody))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read patch for %s: %w", ref.String(), err)
+	}
+
+	xlog.Info("fetched PR patch", "pr", ref.String(), "host", ref.Host,
+		"bytes", len(body), "duration_ms", time.Since(start).Milliseconds(),
+		"link_token", linkToken != "")
+	return body, patchSubjects(body), nil
+}
+
+// patchSubjects extracts the commit subjects ("Subject: [PATCH] ..."
+// lines) from git format-patch text.
+func patchSubjects(raw []byte) []string {
+	var subjects []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Subject:") {
+			continue
+		}
+		s := strings.TrimSpace(strings.TrimPrefix(line, "Subject:"))
+		// Handle "[PATCH]", "[PATCH 2/3]", "[PATCH v2]", ...
+		if i := strings.Index(s, "[PATCH"); i >= 0 {
+			after := s[i:]
+			if close := strings.Index(after, "]"); close >= 0 {
+				s = strings.TrimSpace(after[close+1:])
+			}
+		}
+		if s != "" {
+			subjects = append(subjects, s)
+		}
+	}
+	return subjects
+}
+
+// trimPatchTail removes git format-patch commit headers ("From <sha> Mon
+// Sep 17 ...", From:/Date:/Subject: lines) that trail a file section when a
+// patch contains several commits, so chunk text stays clean.
+func trimPatchTail(sec string) string {
+	const marker = "\nFrom "
+	idx := strings.LastIndex(sec, marker)
+	if idx < 0 {
+		return sec
+	}
+	line := sec[idx+len(marker):]
+	sha, rest, ok := strings.Cut(line, " ")
+	if !ok || len(sha) != 40 || !strings.HasPrefix(rest, "Mon ") {
+		return sec
+	}
+	for _, r := range sha {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return sec
+		}
+	}
+	return strings.TrimRight(sec[:idx+1], "\n") // keep the hunk's own newline
+}
+
 // Meta carries the read-only PR context used to make the review aware of
 // intent: title, description, head branch, and commit messages.
 type Meta struct {
@@ -364,6 +466,7 @@ func ParseDiff(data []byte) []File {
 
 // parseSection parses one "diff --git" file section into a File.
 func parseSection(sec string) File {
+	sec = trimPatchTail(sec)
 	f := File{Text: strings.TrimRight(sec, "\n")}
 
 	if (strings.Contains(sec, "Binary files ") && strings.Contains(sec, "differ")) ||

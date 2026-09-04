@@ -23,8 +23,11 @@ review:
   maxResponseTokens: 2048
   temperature: 0.2
 
-# Optional: GitHub API access for review mode. Token is optional; the
-# GITHUB_TOKEN environment variable is also honored. Without either, only
-# public repositories can be fetched (rate-limited).
+# Optional: GitHub access for review mode.
+# token: API token (config > GITHUB_TOKEN env > gh CLI account > git credentials).
+# diffToken: the ?token= value GitHub puts on shareable .patch/.diff links
+# of private PRs; lets the tool download the PR patch without an API token
+# (useful when the org blocks tokens with private repo access).
 github:
   token: ""
+  diffToken: ""
