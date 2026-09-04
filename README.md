@@ -91,8 +91,20 @@ request intent" so the review knows what the change is supposed to achieve.
 comment on, or otherwise modify anything; use a token scoped to read-only
 if you want a hard guarantee.
 
-GitHub tokens resolve in this order: `github.token` in the config →
-`GITHUB_TOKEN` env var → unauthenticated (public repos only, rate-limited).
+GitHub tokens resolve in this order:
+
+1. `github.token` in the config,
+2. the `GITHUB_TOKEN` environment variable,
+3. the account you are logged in as on this machine for that host — the
+   `gh` CLI (`gh auth token -h <host>`) and then the git credential helper
+   (Git Credential Manager on Windows, the macOS keychain, ...), which
+   reuse the login you already have, e.g. after signing in once via
+   `gh auth login --hostname github.iseccorp.in --web` or storing a token
+   in Git Credential Manager,
+4. unauthenticated (public repos only, rate-limited).
+
+No explicit token in config or env is needed when step 3 succeeds. Tokens
+are read at runtime and never logged.
 
 ### Optional review config
 
@@ -115,8 +127,10 @@ lacks the `{{diff}}` placeholder (the diff would not be sent).
 
 Note for reasoning models (e.g. DeepSeek reasoner variants): `max_tokens`
 counts hidden reasoning tokens, so a large share of `maxResponseTokens` can
-be consumed before any visible output appears. Raise `maxResponseTokens`
-(e.g. `6000`) if chunk reviews come back empty.
+be consumed before any visible output appears. Two mitigations: raise
+`maxResponseTokens` (e.g. `6000`), and instruct the model to answer
+immediately — add "Do NOT think at length - give your answer immediately."
+to `review.systemPrompt`, which reliably stops empty responses.
 
 ### Flags
 

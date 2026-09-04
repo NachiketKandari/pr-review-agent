@@ -133,7 +133,7 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	defer stop()
 
 	// Fetch the diff.
-	token := diff.ResolveToken(cfg.Github.Token)
+	token := diff.ResolveToken(cfg.Github.Token, ref.Host)
 	body, err := diff.Fetch(ctx, ref, token, hc)
 	if err != nil {
 		fatalAttr("diff.fetch", &ref, 0, err)

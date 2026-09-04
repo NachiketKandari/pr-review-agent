@@ -15,7 +15,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -147,22 +146,6 @@ func validHost(h string) bool {
 		}
 	}
 	return true
-}
-
-// ResolveToken resolves the GitHub token: the config-supplied token wins,
-// then the GITHUB_TOKEN environment variable, then unauthenticated access.
-// The chosen source is logged; the token itself is never logged.
-func ResolveToken(cfgToken string) string {
-	if cfgToken != "" {
-		xlog.Info("github token: using config value")
-		return cfgToken
-	}
-	if env := os.Getenv("GITHUB_TOKEN"); env != "" {
-		xlog.Info("github token: using GITHUB_TOKEN environment variable")
-		return env
-	}
-	xlog.Warn("no github token: unauthenticated fetch (public repositories only, lower rate limits)")
-	return ""
 }
 
 func pullPath(ref Ref) string {
