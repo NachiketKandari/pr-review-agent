@@ -52,6 +52,25 @@ func New(opts Options) (*Client, error) {
 		base.Path += "/"
 	}
 
+	hc, err := NewHTTPClient(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{
+		baseURL: base,
+		apiKey:  opts.APIKey,
+		headers: opts.Headers,
+		http:    hc,
+	}, nil
+}
+
+// NewHTTPClient builds an *http.Client from Options (proxy, CA bundle, TLS
+// verification, timeout). It is shared by the model client and the GitHub
+// REST fetches so that corporate proxies and private CA bundles apply to
+// both. Debug-level round-trip logs (sanitized URLs, status, duration) are
+// included; secrets are never logged.
+func NewHTTPClient(opts Options) (*http.Client, error) {
 	tlsCfg := &tls.Config{InsecureSkipVerify: opts.InsecureSkipVerify}
 	if opts.CABundlePath != "" {
 		pem, err := os.ReadFile(opts.CABundlePath)
@@ -82,19 +101,12 @@ func New(opts Options) (*Client, error) {
 		timeout = defaultTimeout
 	}
 
-	transport := &http.Transport{
-		Proxy:           proxy,
-		TLSClientConfig: tlsCfg,
-	}
-
-	return &Client{
-		baseURL: base,
-		apiKey:  opts.APIKey,
-		headers: opts.Headers,
-		http: &http.Client{
-			Timeout:   timeout,
-			Transport: logTransport{base: transport},
-		},
+	return &http.Client{
+		Timeout: timeout,
+		Transport: logTransport{base: &http.Transport{
+			Proxy:           proxy,
+			TLSClientConfig: tlsCfg,
+		}},
 	}, nil
 }
 

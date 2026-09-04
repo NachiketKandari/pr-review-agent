@@ -119,7 +119,12 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	}
 	xlog.Info("model selected", "name", model.Name, "provider", model.Provider, "model", model.Model)
 
-	client, err := newLLMClient(model, f.insecure, f.caPath, f.timeout)
+	opts := modelOptions(model, f.insecure, f.caPath, f.timeout)
+	hc, err := llm.NewHTTPClient(opts)
+	if err != nil {
+		fatal(err)
+	}
+	client, err := llm.New(opts)
 	if err != nil {
 		fatal(err)
 	}
@@ -129,7 +134,7 @@ func runReview(f cfgFlags, ref diff.Ref) {
 
 	// Fetch the diff.
 	token := diff.ResolveToken(cfg.Github.Token)
-	body, err := diff.Fetch(ctx, ref, token)
+	body, err := diff.Fetch(ctx, ref, token, hc)
 	if err != nil {
 		fatalAttr("diff.fetch", &ref, 0, err)
 	}
@@ -144,6 +149,20 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	}
 	xlog.Info("diff parsed", "pr", ref.String(), "files", len(files),
 		"added", added, "deleted", deleted, "binary_skipped", binary)
+
+	// Fetch PR intent context (title, description, commit messages) on a
+	// best-effort basis; the review still runs when it is unavailable.
+	background := ""
+	meta, err := diff.FetchMeta(ctx, ref, token, hc)
+	if err != nil {
+		xlog.Warn("PR metadata unavailable; reviewing the diff only",
+			"pr", ref.String(), "error", err)
+	} else {
+		background = prBackground(meta)
+		xlog.Info("fetched PR metadata", "pr", ref.String(), "host", ref.Host,
+			"title", clip(meta.Title, 120), "commits", len(meta.Commits),
+			"background_chars", len(background))
+	}
 
 	// Wire the agent with config defaults + CLI overrides.
 	maxChunk := cfg.Review.MaxChunkTokens
@@ -164,7 +183,7 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		fatal(err)
 	}
 
-	text, err := agent.Review(ctx, ref, files, os.Stdout)
+	text, err := agent.Review(ctx, ref, files, background, os.Stdout)
 	if err != nil {
 		fatalAttr("review", &ref, 0, err)
 	}
@@ -202,7 +221,7 @@ func runChat(configPath, modelSel string, noStream, insecure bool, caPath string
 	}
 	xlog.Info("model selected", "name", model.Name, "provider", model.Provider, "model", model.Model)
 
-	client, err := newLLMClient(model, insecure, caPath, timeout)
+	client, err := llm.New(modelOptions(model, insecure, caPath, timeout))
 	if err != nil {
 		fatal(err)
 	}
@@ -242,7 +261,8 @@ func runChat(configPath, modelSel string, noStream, insecure bool, caPath string
 		"duration_ms", time.Since(start).Milliseconds())
 }
 
-func newLLMClient(model *config.Model, insecure bool, caPath string, timeout time.Duration) (*llm.Client, error) {
+// modelOptions builds the shared llm.Options from config + CLI flags.
+func modelOptions(model *config.Model, insecure bool, caPath string, timeout time.Duration) llm.Options {
 	opts := llm.Options{
 		APIBase: model.APIBase,
 		APIKey:  model.APIKey,
@@ -267,8 +287,48 @@ func newLLMClient(model *config.Model, insecure bool, caPath string, timeout tim
 	if timeout > 0 {
 		opts.Timeout = timeout
 	}
-	return llm.New(opts)
+	return opts
 }
+
+// prBackground composes the intent context handed to the review: PR title,
+// description, head branch, and commit messages, all length-capped so a
+// huge PR body cannot blow up every prompt.
+func prBackground(m diff.Meta) string {
+	var b strings.Builder
+
+	if m.Title != "" {
+		fmt.Fprintf(&b, "Title: %s\n", clip(m.Title, 300))
+	}
+	if m.HeadRef != "" {
+		fmt.Fprintf(&b, "Branch: %s\n", clip(m.HeadRef, 200))
+	}
+	if m.Body != "" {
+		fmt.Fprintf(&b, "Description:\n%s\n", clip(m.Body, bgBodyCap))
+	}
+	if len(m.Commits) > 0 {
+		b.WriteString("Commit messages:\n")
+		for _, c := range m.Commits {
+			first := c
+			if i := strings.IndexByte(c, '\n'); i >= 0 {
+				first = c[:i]
+			}
+			fmt.Fprintf(&b, "- %s\n", clip(strings.TrimSpace(first), 200))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// Context caps for prBackground.
+const (
+	bgBodyCap = 4000
+)
 
 // fatal logs a structured error with package/PR context, then exits.
 func fatalAttr(pkg string, ref *diff.Ref, chunkIndex int, err error) {

@@ -10,27 +10,33 @@ import (
 )
 
 func TestParseURL(t *testing.T) {
+	gh := "github.com"
+	corp := "github.iseccorp.in"
 	cases := []struct {
 		raw   string
 		want  Ref
 		error bool
 	}{
-		{"https://github.com/octocat/Hello-World/pull/123", Ref{"octocat", "Hello-World", 123}, false},
-		{"https://github.com/octocat/Hello-World/pull/123/", Ref{"octocat", "Hello-World", 123}, false},
-		{"https://github.com/octocat/Hello-World/pull/123/files", Ref{"octocat", "Hello-World", 123}, false},
-		{"https://github.com/octocat/Hello-World/pull/123#issuecomment-1", Ref{"octocat", "Hello-World", 123}, false},
-		{"github.com/octocat/Hello-World/pull/123", Ref{"octocat", "Hello-World", 123}, false},
-		{"www.github.com/octocat/Hello-World/pull/123", Ref{"octocat", "Hello-World", 123}, false},
-		{"octocat/Hello-World/pull/123", Ref{"octocat", "Hello-World", 123}, false},
-		{"  https://github.com/a/b/pull/1  ", Ref{"a", "b", 1}, false},
+		{"https://github.com/octocat/Hello-World/pull/123", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"https://github.com/octocat/Hello-World/pull/123/", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"https://github.com/octocat/Hello-World/pull/123/files", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"https://github.com/octocat/Hello-World/pull/123#issuecomment-1", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"github.com/octocat/Hello-World/pull/123", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"www.github.com/octocat/Hello-World/pull/123", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"octocat/Hello-World/pull/123", Ref{gh, "octocat", "Hello-World", 123}, false},
+		{"  https://github.com/a/b/pull/1  ", Ref{gh, "a", "b", 1}, false},
+
+		// GitHub Enterprise hosts resolve to their own API.
+		{"https://github.iseccorp.in/team/proj/pull/12", Ref{corp, "team", "proj", 12}, false},
+		{"github.iseccorp.in/team/proj/pull/12", Ref{corp, "team", "proj", 12}, false},
+		{"https://github.iseccorp.in/team/proj/pull/12/files", Ref{corp, "team", "proj", 12}, false},
 
 		{"https://github.com/octocat/Hello-World/pull/0", Ref{}, true},
 		{"https://github.com/octocat/Hello-World/pull/abc", Ref{}, true},
 		{"https://github.com/octocat/Hello-World/pull/", Ref{}, true},
 		{"https://github.com/octocat/Hello-World/issues/123", Ref{}, true},
 		{"https://github.com/octocat/Hello-World", Ref{}, true},
-		{"https://gitlab.com/octocat/Hello-World/pull/1", Ref{}, true},
-		{"https://github.com/octocat/Hello-World", Ref{}, true},
+		{"https://gitlab.com/octocat/Hello-World", Ref{}, true},
 		{"http://github.com/octocat/Hello-World/pull/1", Ref{}, true},
 		{"https://github.com/octocat", Ref{}, true},
 		{"", Ref{}, true},
@@ -52,6 +58,39 @@ func TestParseURL(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("ParseURL(%q) = %+v, want %+v", tc.raw, got, tc.want)
 		}
+	}
+}
+
+func TestRefURLs(t *testing.T) {
+	ref := Ref{Host: "github.com", Owner: "octocat", Repo: "Hello-World", Number: 42}
+	if got := ref.GitHubURL(); got != "https://github.com/octocat/Hello-World/pull/42" {
+		t.Errorf("GitHubURL = %q", got)
+	}
+	if got := ref.apiBase(); got != "https://api.github.com" {
+		t.Errorf("github.com apiBase = %q", got)
+	}
+	if got := ref.String(); got != "octocat/Hello-World#42" {
+		t.Errorf("String = %q", got)
+	}
+
+	ent := Ref{Host: "github.iseccorp.in", Owner: "team", Repo: "proj", Number: 7}
+	if got := ent.apiBase(); got != "https://github.iseccorp.in/api/v3" {
+		t.Errorf("enterprise apiBase = %q", got)
+	}
+	if got := ent.GitHubURL(); got != "https://github.iseccorp.in/team/proj/pull/7" {
+		t.Errorf("enterprise GitHubURL = %q", got)
+	}
+	if got := ent.apiBase(); got != "https://github.iseccorp.in/api/v3" {
+		t.Errorf("apiBase = %q", got)
+	}
+
+	// Zero host defaults to github.com.
+	zero := Ref{Owner: "a", Repo: "b", Number: 1}
+	if got := zero.apiBase(); got != "https://api.github.com" {
+		t.Errorf("zero-host apiBase = %q", got)
+	}
+	if got := zero.GitHubURL(); got != "https://github.com/a/b/pull/1" {
+		t.Errorf("zero-host GitHubURL = %q", got)
 	}
 }
 
@@ -159,9 +198,8 @@ func TestFetchHeadersAndAuth(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	ref := Ref{Owner: "octocat", Repo: "Hello-World", Number: 42}
-	apiURL := srv.URL + "/repos/octocat/Hello-World/pulls/42"
-	if _, err := fetch(context.Background(), apiURL, ref, "ghp_secret"); err != nil {
+	ref := Ref{Host: "github.com", Owner: "octocat", Repo: "Hello-World", Number: 42}
+	if _, err := getAt(context.Background(), nil, srv.URL, ref, "ghp_secret", diffAccept, "/repos/octocat/Hello-World/pulls/42", "diff"); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer ghp_secret" {
@@ -174,7 +212,7 @@ func TestFetchHeadersAndAuth(t *testing.T) {
 		t.Error("User-Agent not set")
 	}
 
-	if _, err := fetch(context.Background(), apiURL, ref, ""); err != nil {
+	if _, err := getAt(context.Background(), nil, srv.URL, ref, "", diffAccept, "/repos/octocat/Hello-World/pulls/42", "diff"); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "" {
@@ -197,7 +235,7 @@ func TestFetchErrors(t *testing.T) {
 		{"unprocessable", http.StatusUnprocessableEntity, nil, `{"message":"Diff too large"}`, "too large"},
 		{"server error", http.StatusInternalServerError, nil, `boom`, "HTTP 500"},
 	}
-	ref := Ref{Owner: "octocat", Repo: "Hello-World", Number: 7}
+	ref := Ref{Host: "github.com", Owner: "octocat", Repo: "Hello-World", Number: 7}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -209,7 +247,7 @@ func TestFetchErrors(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			_, err := fetch(context.Background(), srv.URL, ref, "tok")
+			_, err := getAt(context.Background(), nil, srv.URL, ref, "tok", diffAccept, "/x", "diff")
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -217,5 +255,81 @@ func TestFetchErrors(t *testing.T) {
 				t.Errorf("error = %q, want substring %q", err, tc.wantSubstr)
 			}
 		})
+	}
+}
+
+func TestFetchMeta(t *testing.T) {
+	seen := map[string]bool{}
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		seen[r.URL.Path] = true
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/9":
+			fmt.Fprint(w, `{"title":"Add retry to fetch","body":"Closes ABC-123. Keeps on trying.","head":{"ref":"feature/ABC-123-retry"}}`)
+		case "/repos/acme/widgets/pulls/9/commits":
+			fmt.Fprint(w, `[
+				{"commit":{"message":"feat: retry fetch calls\n\nAdds three attempts with backoff."}},
+				{"commit":{"message":"fix: typo in comment"}}
+			]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ref := Ref{Host: "github.com", Owner: "acme", Repo: "widgets", Number: 9}
+	m, err := fetchMeta(context.Background(), ref, "tok", nil, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seen["/repos/acme/widgets/pulls/9"] || !seen["/repos/acme/widgets/pulls/9/commits"] {
+		t.Errorf("requested paths = %v", seen)
+	}
+	if gotAuth != "Bearer tok" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+	if m.Title != "Add retry to fetch" || m.Body != "Closes ABC-123. Keeps on trying." {
+		t.Errorf("meta = %+v", m)
+	}
+	if m.HeadRef != "feature/ABC-123-retry" {
+		t.Errorf("HeadRef = %q", m.HeadRef)
+	}
+	if len(m.Commits) != 2 || !strings.Contains(m.Commits[0], "feat: retry fetch calls") {
+		t.Errorf("commits = %v", m.Commits)
+	}
+}
+
+func TestFetchMetaNullBodyAndError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/9":
+			fmt.Fprint(w, `{"title":"t","body":null,"head":{"ref":"main"}}`)
+		case "/repos/acme/widgets/pulls/9/commits":
+			fmt.Fprint(w, `[]`)
+		default:
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"message":"nope"}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ref := Ref{Host: "github.com", Owner: "acme", Repo: "widgets", Number: 9}
+
+	m, err := fetchMeta(context.Background(), ref, "tok", nil, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Body != "" || m.Title != "t" {
+		t.Errorf("meta = %+v (null body must read as empty)", m)
+	}
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv2.Close)
+	if _, err := fetchMeta(context.Background(), ref, "tok", nil, srv2.URL); err == nil {
+		t.Error("expected error when PR metadata is not found")
+	} else if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q", err)
 	}
 }

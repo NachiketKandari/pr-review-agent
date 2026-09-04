@@ -144,7 +144,7 @@ func TestReviewSingleChunkStreamsFinalMerge(t *testing.T) {
 
 	var out bytes.Buffer
 	want := "## merged review\nfinal output"
-	got, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, &out)
+	got, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, "", &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestReviewTwoChunksSingleFinalMerge(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	got, err := a.Review(context.Background(), testRef(), files, &out)
+	got, err := a.Review(context.Background(), testRef(), files, "", &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,6 +299,30 @@ func TestReduceSingleOversizedFinding(t *testing.T) {
 	}
 }
 
+func TestBackgroundContextReachesSystemPrompts(t *testing.T) {
+	fake := &fakeLLM{
+		chatResp:   func(call int, req llm.ChatRequest) (string, error) { return "C", nil },
+		streamResp: func(call int, req llm.ChatRequest) (string, error) { return "F", nil },
+	}
+	a, err := New(Options{Model: "m", Client: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	bg := "Goal: fix ABC-123 retry behaviour. See Jira ABC-123."
+	if _, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, bg, &out); err != nil {
+		t.Fatal(err)
+	}
+	system, _ := fake.chatCalls[0].Messages[0].Content.(string)
+	if !strings.Contains(system, bg) || !strings.Contains(system, "Pull request intent") {
+		t.Errorf("chunk system prompt missing intent context: %q", system)
+	}
+	mergeSystem, _ := fake.streamCalls[0].Messages[0].Content.(string)
+	if !strings.Contains(mergeSystem, bg) {
+		t.Errorf("merge system prompt missing intent context: %q", mergeSystem)
+	}
+}
+
 func TestReviewNoChunks(t *testing.T) {
 	fake := &fakeLLM{}
 	a, err := New(Options{Model: "m", Client: fake})
@@ -306,7 +330,7 @@ func TestReviewNoChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	got, err := a.Review(context.Background(), testRef(), nil, &out)
+	got, err := a.Review(context.Background(), testRef(), nil, "", &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +360,7 @@ func TestEnricherSeamCalledOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if _, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, &out); err != nil {
+	if _, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, "", &out); err != nil {
 		t.Fatal(err)
 	}
 	if enrichCalls != 1 {

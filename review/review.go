@@ -79,6 +79,7 @@ type Agent struct {
 	temperature  float64
 	client       LLM
 	enricher     Enricher
+	background   string // PR intent context set per Review call
 }
 
 // New validates Options and applies defaults.
@@ -128,12 +129,17 @@ func New(opts Options) (*Agent, error) {
 
 // Review runs the full map-reduce review of files, streaming the final
 // merged review to out, and returns the full merged text (identical to what
-// was streamed). Logs every stage: chunking, per-chunk review, intermediate
-// merges, and the final merge.
-func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, out io.Writer) (string, error) {
+// was streamed). background is optional intent context (PR title and
+// description, Jira goal, commit messages); when non-empty it is appended
+// to the system prompt of every chunk review and merge call so the review
+// is anchored to what the change is supposed to achieve. Logs every stage:
+// chunking, per-chunk review, intermediate merges, and the final merge.
+func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, background string, out io.Writer) (string, error) {
+	a.background = background
+	defer func() { a.background = "" }()
 	xlog.Info("review start",
 		"pr", ref.String(), "model", a.model,
-		"files", len(files),
+		"files", len(files), "background_chars", len(background),
 		"max_chunk_tokens", a.maxChunk, "max_response_tokens", a.maxResponse,
 		"temperature", a.temperature)
 
@@ -293,6 +299,15 @@ func (a *Agent) mergeChat(ctx context.Context, group []string) (string, error) {
 	return a.chat(ctx, a.buildMergeMessages(group), a.model)
 }
 
+// systemText returns the system prompt with the PR intent context appended
+// when one was supplied to Review.
+func (a *Agent) systemText() string {
+	if a.background == "" {
+		return a.systemPrompt
+	}
+	return a.systemPrompt + "\n\n## Pull request intent\n" + a.background
+}
+
 func (a *Agent) buildMessages(c chunk.Chunk, enrichment string) []llm.Message {
 	replacer := strings.NewReplacer(
 		"{{index}}", fmt.Sprint(c.Index),
@@ -306,14 +321,14 @@ func (a *Agent) buildMessages(c chunk.Chunk, enrichment string) []llm.Message {
 		user = "Extra context about the changed code:\n" + enrichment + "\n\n" + user
 	}
 	return []llm.Message{
-		{Role: "system", Content: a.systemPrompt},
+		{Role: "system", Content: a.systemText()},
 		{Role: "user", Content: user},
 	}
 }
 
 func (a *Agent) buildMergeMessages(parts []string) []llm.Message {
 	return []llm.Message{
-		{Role: "system", Content: a.systemPrompt},
+		{Role: "system", Content: a.systemText()},
 		{Role: "user", Content: strings.NewReplacer(
 			"{{findings}}", strings.Join(parts, "\n\n---\n\n"),
 		).Replace(a.mergePrompt)},

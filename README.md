@@ -66,11 +66,30 @@ go run . "octocat/Hello-World/pull/123"                    # shortened
 go run . -output review.md "octocat/Hello-World/pull/123"  # also save to file
 ```
 
-The flow: parse the URL → fetch the unified diff from the GitHub API (Bearer
-auth when a token is available) → split it into chunks (greedy at file
-boundaries, then hunks, then lines) → review each chunk with one capped model
-call → merge findings, recursively when they overflow the context budget →
-stream the final merged review to stdout.
+GitHub Enterprise works the same way — paste any Enterprise PR URL and the
+tool talks to that host's API (`https://<host>/api/v3`):
+
+```sh
+go run . "https://github.iseccorp.in/team/proj/pull/12"
+```
+
+Because the review model and the GitHub client share one HTTP setup, the
+`-ca`, `-insecure`, and `requestOptions.proxy`/`caBundlePath` settings apply
+to Enterprise TLS as well (corporate proxies/private CAs).
+
+The flow: parse the URL → fetch the unified diff **and read-only PR
+metadata** (title, description, branch, commit messages) from the GitHub API
+(Bearer auth when a token is available) → split the diff into chunks (greedy
+at file boundaries, then hunks, then lines) → review each chunk with one
+capped model call → merge findings, recursively when they overflow the
+context budget → stream the final merged review to stdout. The PR title,
+description, and commit messages are injected into every prompt as "Pull
+request intent" so the review knows what the change is supposed to achieve.
+
+**Read-only by design:** only GET endpoints are used (`/pulls/N` diff,
+`/pulls/N` metadata, `/pulls/N/commits`). The tool can never create, merge,
+comment on, or otherwise modify anything; use a token scoped to read-only
+if you want a hard guarantee.
 
 GitHub tokens resolve in this order: `github.token` in the config →
 `GITHUB_TOKEN` env var → unauthenticated (public repos only, rate-limited).
@@ -140,7 +159,7 @@ fatal path logs a structured error with package/PR/chunk context.
 main.go            CLI entry point: chat + review mode, flag wiring
 config/            Continue-style yaml parsing and model selection
 llm/               OpenAI-compatible HTTP client (chat, SSE streaming, models)
-diff/              PR URL parsing, GitHub diff fetch, unified-diff parsing
+diff/              PR URL parsing, GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing
 chunk/             len/4 token estimation, greedy chunk building
 review/            map-reduce review agent (prompts, chunk reviews, merges)
 xlog/              slog setup (stderr + JSON file), URL/token redaction
@@ -150,6 +169,9 @@ xlog/              slog setup (stderr + JSON file), URL/token redaction
 
 - [x] `go run . "pr-link"` to fetch a PR diff and review it
 - [x] Chunked review of large diffs
+- [x] GitHub Enterprise hosts and read-only PR intent context (title, description, commit messages)
+- [ ] Jira integration: detect the ticket key in the PR title/branch, fetch the
+      ticket summary/description, and feed the acceptance goal into the review
 - [ ] Deep Go-aware review (go/ast symbol tables, call graphs) — the review
       package already exposes an optional `Enricher` seam so this drops in
       without orchestrator changes
