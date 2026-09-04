@@ -77,21 +77,56 @@ Because the review model and the GitHub client share one HTTP setup, the
 `-ca`, `-insecure`, and `requestOptions.proxy`/`caBundlePath` settings apply
 to Enterprise TLS as well (corporate proxies/private CAs).
 
-The flow: parse the URL → fetch the unified diff **and read-only PR
-metadata** (title, description, branch, commit messages) from the GitHub API
-(Bearer auth when a token is available) → split the diff into chunks (greedy
-at file boundaries, then hunks, then lines) → review each chunk with one
-capped model call → merge findings, recursively when they overflow the
-context budget → stream the final merged review to stdout. The PR title,
-description, and commit messages are injected into every prompt as "Pull
-request intent" so the review knows what the change is supposed to achieve.
+The diff is obtained in this order of preference:
 
-**Read-only by design:** only GET endpoints are used (`/pulls/N` diff,
-`/pulls/N` metadata, `/pulls/N/commits`). The tool can never create, merge,
-comment on, or otherwise modify anything; use a token scoped to read-only
-if you want a hard guarantee.
+1. **Local git clone** (default when it applies): run the tool from inside
+   a clone of the repository (or point `-repo` at one) and it fetches
+   `refs/pull/N/head` plus the default branch with git itself, then diffs
+   `merge-base(base)...head` — exactly the GitHub PR shape. Git uses its
+   own credentials (SSH key, Git Credential Manager), so **no API token is
+   needed**, which also works when your org blocks tokens with private
+   repo access.
+2. **GitHub REST API** when no matching clone is found: read-only GET
+   requests for the diff and PR metadata (Bearer auth when a token is
+   available).
+3. **`-diff file.diff`** reviews a unified diff file you exported yourself
+   (see below) and never contacts GitHub.
 
-GitHub tokens resolve in this order:
+The flow then continues: split the diff into chunks (greedy at file
+boundaries, then hunks, then lines) → review each chunk with one capped
+model call → merge findings, recursively when they overflow the context
+budget → stream the final merged review to stdout. The PR title,
+description, and commit messages (from the API or from `git log` in clone
+mode) are injected into every prompt as "Pull request intent" so the review
+knows what the change is supposed to achieve.
+
+**Read-only by design:** the API path only uses GET endpoints (`/pulls/N`
+diff, `/pulls/N` metadata, `/pulls/N/commits`), and the clone path runs
+read-only `git fetch`/`git diff`/`git log`. The tool can never create,
+merge, comment on, or otherwise modify anything.
+
+### Reviewing without an API token (blocked private-repo tokens)
+
+If your org does not allow tokens with private repository access but you
+can still clone the repo with your normal git login, produce the diff
+yourself and review the file (or clone the repo and use `-repo`):
+
+```bat
+rem inside a clone of the repository (cmd.exe):
+git fetch origin refs/pull/871/head:pr-871
+git diff origin/main...pr-871 > pr-871.diff
+```
+```bat
+rem then either review the exported file:
+pr-review-agent -diff pr-871.diff "https://github.iseccorp.in/ORG/REPO/pull/871"
+rem or point the tool straight at the clone (no export needed):
+pr-review-agent -repo C:\path	oepo "https://github.iseccorp.in/ORG/REPO/pull/871"
+```
+
+(Adjust `origin/main` to the actual base branch.) The URL is optional when
+using `-diff`; without it the tool reviews the file with no GitHub context.
+
+GitHub API tokens resolve in this order:
 
 1. `github.token` in the config,
 2. the `GITHUB_TOKEN` environment variable,
@@ -144,6 +179,8 @@ to `review.systemPrompt`, which reliably stops empty responses.
 | `-timeout`     | config or 2h | request timeout, e.g. `2m`                             |
 | `-output`      | empty        | write the merged review to this file (review mode)     |
 | `-chunk-tokens`| config       | override `review.maxChunkTokens` (review mode)         |
+| `-repo`        | current dir  | local clone to diff with git instead of the API (review mode) |
+| `-diff`        | empty        | review a local unified diff file instead of fetching (review mode) |
 | `-log-file`    | empty        | append structured JSON logs to this file               |
 | `-debug`       | `false`      | Info level + HTTP-level detail (sanitized URLs, status codes, durations) |
 | `-quiet`       | `false`      | errors and warnings only                               |

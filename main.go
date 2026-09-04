@@ -42,6 +42,8 @@ func main() {
 	caPath := flag.String("ca", "", "path to a CA bundle file")
 	timeout := flag.Duration("timeout", 0, "request timeout (overrides requestOptions.timeout)")
 	outputPath := flag.String("output", "", "write the review to this file (review mode)")
+	diffPath := flag.String("diff", "", "review a local unified diff file instead of fetching from GitHub")
+	repoDir := flag.String("repo", "", "path to a local clone of the repo to diff with git (default: try current directory, then GitHub API)")
 	chunkTokens := flag.Int("chunk-tokens", 0, "override review.maxChunkTokens (review mode)")
 	logFile := flag.String("log-file", "", "also append structured JSON logs to this file")
 	debug := flag.Bool("debug", false, "log HTTP-level detail (request URLs, statuses, durations)")
@@ -62,23 +64,32 @@ func main() {
 	defer cleanupLog()
 
 	args := flag.Args()
-	if len(args) == 0 {
+	if len(args) == 0 && *diffPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: go run . [flags] \"PR URL\" | \"your message\"")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 
-	// A first argument that parses as a GitHub PR URL selects review mode.
+	flags := cfgFlags{
+		configPath:  *configPath,
+		modelSel:    *modelSel,
+		insecure:    *insecure,
+		caPath:      *caPath,
+		timeout:     *timeout,
+		outputPath:  *outputPath,
+		chunkTokens: *chunkTokens,
+		diffPath:    *diffPath,
+		repoDir:     *repoDir,
+	}
+
+	// A first argument that parses as a GitHub PR URL selects review mode;
+	// -diff reviews a local diff file (the URL is then optional context).
 	if ref, err := diff.ParseURL(args[0]); err == nil {
-		runReview(cfgFlags{
-			configPath:  *configPath,
-			modelSel:    *modelSel,
-			insecure:    *insecure,
-			caPath:      *caPath,
-			timeout:     *timeout,
-			outputPath:  *outputPath,
-			chunkTokens: *chunkTokens,
-		}, ref)
+		runReview(flags, ref)
+		return
+	}
+	if *diffPath != "" {
+		runReview(flags, diff.Ref{})
 		return
 	}
 
@@ -94,11 +105,22 @@ type cfgFlags struct {
 	timeout     time.Duration
 	outputPath  string
 	chunkTokens int
+	diffPath    string
+	repoDir     string
 }
 
-// runReview drives the map-reduce review of a single PR.
+// runReview drives the map-reduce review of a single PR. When f.diffPath
+// is set, the diff is read from a local file produced by git (the GitHub
+// API is not contacted), which works when the org blocks API tokens but
+// git over SSH/credentials is available.
 func runReview(f cfgFlags, ref diff.Ref) {
-	xlog.Info("review mode", "pr", ref.GitHubURL())
+	localFile := f.diffPath != ""
+	validRef := ref.Number > 0
+	if localFile {
+		xlog.Info("review mode (local diff)", "diff_file", f.diffPath, "pr", ref.String())
+	} else {
+		xlog.Info("review mode", "pr", ref.GitHubURL())
+	}
 
 	cfg, err := config.Load(f.configPath)
 	if err != nil {
@@ -132,11 +154,51 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Fetch the diff.
-	token := diff.ResolveToken(cfg.Github.Token, ref.Host)
-	body, err := diff.Fetch(ctx, ref, token, hc)
-	if err != nil {
-		fatalAttr("diff.fetch", &ref, 0, err)
+	// Fetch the diff. Preferred order: -diff local file, then the local git
+	// clone (-repo or the current directory) using git's own credentials,
+	// then the GitHub REST API.
+	var token string
+	var body []byte
+	gitMeta := diff.Meta{}
+	usedGit := false
+	switch {
+	case localFile:
+		body, err = os.ReadFile(f.diffPath)
+		if err != nil {
+			fatalAttr("diff.read", &ref, 0, err)
+		}
+		xlog.Info("loaded local diff", "path", f.diffPath, "bytes", len(body))
+	case validRef:
+		dir := f.repoDir
+		if dir == "" {
+			dir = "."
+		}
+		if err := diff.RepoMatches(ctx, dir, ref); err == nil {
+			body, gitMeta, err = diff.RepoDiff(ctx, dir, ref)
+			if err != nil {
+				if f.repoDir != "" {
+					fatalAttr("git.diff", &ref, 0, err)
+				}
+				xlog.Warn("local git diff failed; falling back to the GitHub API",
+					"pr", ref.String(), "error", err)
+			} else {
+				usedGit = true
+				xlog.Info("using local git clone for the diff (no API token needed)",
+					"pr", ref.String(), "dir", dir, "bytes", len(body))
+			}
+		} else if f.repoDir != "" {
+			fatalAttr("git.repo", &ref, 0, err)
+		} else {
+			xlog.Info("no matching local clone in current directory; using the GitHub API",
+				"pr", ref.String(), "error", err)
+		}
+	}
+	if len(body) == 0 && !usedGit && !localFile && validRef {
+		token = diff.ResolveToken(cfg.Github.Token, ref.Host)
+		body, err = diff.Fetch(ctx, ref, token, hc)
+		if err != nil {
+			fatalAttr("diff.fetch", &ref, 0, err)
+		}
 	}
 	files := diff.ParseDiff(body)
 	added, deleted, binary := 0, 0, 0
@@ -150,18 +212,28 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	xlog.Info("diff parsed", "pr", ref.String(), "files", len(files),
 		"added", added, "deleted", deleted, "binary_skipped", binary)
 
-	// Fetch PR intent context (title, description, commit messages) on a
-	// best-effort basis; the review still runs when it is unavailable.
+	// PR intent context (title, description, commit messages) is gathered
+	// from git when the diff came from a clone, otherwise best-effort from
+	// the GitHub API; the review runs either way.
 	background := ""
-	meta, err := diff.FetchMeta(ctx, ref, token, hc)
-	if err != nil {
-		xlog.Warn("PR metadata unavailable; reviewing the diff only",
-			"pr", ref.String(), "error", err)
-	} else {
-		background = prBackground(meta)
-		xlog.Info("fetched PR metadata", "pr", ref.String(), "host", ref.Host,
-			"title", clip(meta.Title, 120), "commits", len(meta.Commits),
-			"background_chars", len(background))
+	if usedGit {
+		background = prBackground(gitMeta)
+		xlog.Info("gathered PR context from git", "pr", ref.String(),
+			"commits", len(gitMeta.Commits), "background_chars", len(background))
+	} else if validRef {
+		if token == "" {
+			token = diff.ResolveToken(cfg.Github.Token, ref.Host)
+		}
+		meta, err := diff.FetchMeta(ctx, ref, token, hc)
+		if err != nil {
+			xlog.Warn("PR metadata unavailable; reviewing the diff only",
+				"pr", ref.String(), "error", err)
+		} else {
+			background = prBackground(meta)
+			xlog.Info("fetched PR metadata", "pr", ref.String(), "host", ref.Host,
+				"title", clip(meta.Title, 120), "commits", len(meta.Commits),
+				"background_chars", len(background))
+		}
 	}
 
 	// Wire the agent with config defaults + CLI overrides.
@@ -202,7 +274,11 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		}
 		xlog.Info("wrote review output", "pr", ref.String(), "path", f.outputPath, "bytes", len(text))
 	}
-	xlog.Info("review succeeded", "pr", ref.String(), "pr_url", ref.GitHubURL())
+	if validRef {
+		xlog.Info("review succeeded", "pr", ref.String(), "pr_url", ref.GitHubURL())
+	} else {
+		xlog.Info("review succeeded", "pr", ref.String(), "diff_file", f.diffPath)
+	}
 }
 
 // runChat is the original single-message chat flow.
