@@ -44,6 +44,7 @@ func main() {
 	outputPath := flag.String("output", "", "write the review to this file (review mode)")
 	diffPath := flag.String("diff", "", "review a local unified diff file instead of fetching from GitHub")
 	diffToken := flag.String("diff-token", "", "the ?token= value GitHub puts on private .patch/.diff links (overrides github.diffToken)")
+	repoDir := flag.String("repo", "", "path to a local clone of the repo; diff it with git instead of the API (default: try the current directory)")
 	chunkTokens := flag.Int("chunk-tokens", 0, "override review.maxChunkTokens (review mode)")
 	logFile := flag.String("log-file", "", "also append structured JSON logs to this file")
 	debug := flag.Bool("debug", false, "log HTTP-level detail (request URLs, statuses, durations)")
@@ -80,6 +81,7 @@ func main() {
 		chunkTokens: *chunkTokens,
 		diffPath:    *diffPath,
 		diffToken:   *diffToken,
+		repoDir:     *repoDir,
 	}
 
 	// A first argument that parses as a GitHub PR URL selects review mode;
@@ -107,6 +109,7 @@ type cfgFlags struct {
 	chunkTokens int
 	diffPath    string
 	diffToken   string
+	repoDir     string
 }
 
 // runReview drives the map-reduce review of a single PR. When f.diffPath
@@ -154,12 +157,15 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Fetch the diff. Preferred order: -diff local file, then the PR's
-	// .patch web link (authenticated by github.diffToken when configured),
-	// then the GitHub REST API.
+	// Fetch the diff. Preferred order: -diff local file, then the local git
+	// clone (run from inside the repo, or point -repo at it) using git's own
+	// credentials, then the PR's .patch web link (github.diffToken), then
+	// the GitHub REST API.
 	var token string
 	var body []byte
+	gitMeta := diff.Meta{}
 	patchMeta := diff.Meta{}
+	usedGit := false
 	usedPatch := false
 	switch {
 	case localFile:
@@ -169,30 +175,61 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		}
 		xlog.Info("loaded local diff", "path", f.diffPath, "bytes", len(body))
 	case validRef:
-		linkToken := f.diffToken
-		if linkToken == "" {
-			linkToken = cfg.Github.DiffToken
+		// Git route: no API token needed; git uses the credentials you
+		// already have (SSH key / Git Credential Manager).
+		dir := f.repoDir
+		if dir == "" {
+			dir = "."
 		}
-		if linkToken == "" {
-			linkToken = os.Getenv("GITHUB_DIFF_TOKEN")
+		if err := diff.RepoMatches(ctx, dir, ref); err == nil {
+			body, gitMeta, err = diff.RepoDiff(ctx, dir, ref)
+			if err != nil {
+				if f.repoDir != "" {
+					fatalAttr("git.diff", &ref, 0, err)
+				}
+				xlog.Warn("local git diff failed; trying the next fetch route",
+					"pr", ref.String(), "error", err)
+			} else if len(body) == 0 {
+				// Merged/closed PRs have their commits in the base branch
+				// already, so merge-base diffing yields nothing.
+				xlog.Warn("git diff is empty (the PR may be merged or closed); trying the next fetch route",
+					"pr", ref.String())
+			} else {
+				usedGit = true
+				xlog.Info("using local git clone for the diff (no API token needed)",
+					"pr", ref.String(), "dir", dir, "bytes", len(body))
+			}
+		} else if f.repoDir != "" {
+			fatalAttr("git.repo", &ref, 0, err)
 		}
-		if linkToken != "" {
-			xlog.Info("fetching PR patch via .patch link (github.diffToken)", "pr", ref.String())
-			var subjects []string
-			body, subjects, err = diff.FetchPatch(ctx, ref, linkToken, hc)
-			if err != nil {
-				fatalAttr("patch.fetch", &ref, 0, err)
+		if !usedGit {
+			xlog.Info("no matching local clone; trying the .patch link / API routes",
+				"pr", ref.String())
+			linkToken := f.diffToken
+			if linkToken == "" {
+				linkToken = cfg.Github.DiffToken
 			}
-			usedPatch = true
-			if len(subjects) > 0 {
-				patchMeta.Title = subjects[0]
+			if linkToken == "" {
+				linkToken = os.Getenv("GITHUB_DIFF_TOKEN")
 			}
-			patchMeta.Commits = subjects
-		} else {
-			token = diff.ResolveToken(cfg.Github.Token, ref.Host)
-			body, err = diff.Fetch(ctx, ref, token, hc)
-			if err != nil {
-				fatalAttr("diff.fetch", &ref, 0, err)
+			if linkToken != "" {
+				xlog.Info("fetching PR patch via .patch link (github.diffToken)", "pr", ref.String())
+				var subjects []string
+				body, subjects, err = diff.FetchPatch(ctx, ref, linkToken, hc)
+				if err != nil {
+					fatalAttr("patch.fetch", &ref, 0, err)
+				}
+				usedPatch = true
+				if len(subjects) > 0 {
+					patchMeta.Title = subjects[0]
+				}
+				patchMeta.Commits = subjects
+			} else {
+				token = diff.ResolveToken(cfg.Github.Token, ref.Host)
+				body, err = diff.Fetch(ctx, ref, token, hc)
+				if err != nil {
+					fatalAttr("diff.fetch", &ref, 0, err)
+				}
 			}
 		}
 	}
@@ -209,14 +246,20 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		"added", added, "deleted", deleted, "binary_skipped", binary)
 
 	// PR intent context (title, description, commit messages) comes from
-	// the patch headers when the .patch route was used, otherwise
-	// best-effort from the GitHub API; the review runs either way.
+	// git when the clone route was used, from the patch headers when the
+	// .patch route was used, otherwise best-effort from the GitHub API;
+	// the review runs either way.
 	background := ""
-	if usedPatch {
+	switch {
+	case usedGit:
+		background = prBackground(gitMeta)
+		xlog.Info("gathered PR context from git", "pr", ref.String(),
+			"commits", len(gitMeta.Commits), "background_chars", len(background))
+	case usedPatch:
 		background = prBackground(patchMeta)
 		xlog.Info("gathered PR context from patch", "pr", ref.String(),
 			"commits", len(patchMeta.Commits), "background_chars", len(background))
-	} else if validRef {
+	case validRef:
 		if token == "" {
 			token = diff.ResolveToken(cfg.Github.Token, ref.Host)
 		}
