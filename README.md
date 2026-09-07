@@ -52,7 +52,14 @@ go run . "Hello, who are you?"                 # streams the response
 go run . -no-stream "Hello"                    # plain, non-streamed response
 go run . -model qwen "Hello"                   # pick model by name, substring, or index
 go run . -config config.yaml "Hello"           # use a different config file
+go run . -prompt-file prompt.txt               # read the message from a text file
 ```
+
+`-prompt-file` points at a text file whose content is used as the message —
+handy for long or multiline prompts that are awkward to quote on the command
+line. Surrounding whitespace in the file is trimmed; the file must not be
+empty. If both a message and `-prompt-file` are given, the file wins (a
+warning is logged).
 
 ### Review mode
 
@@ -212,6 +219,16 @@ github:
 Overriding a prompt is safe: the code only warns if your custom `chunkPrompt`
 lacks the `{{diff}}` placeholder (the diff would not be sent).
 
+You can also override the review instructions for a single run with
+`-prompt-file` — its content replaces `review.systemPrompt` (the chunk and
+merge prompts come from the config as usual), which is useful for one-off
+review styles without editing `local.yaml`:
+
+```sh
+go run . -prompt-file review-instructions.txt "feature/auth" "main"
+go run . -prompt-file review-instructions.txt "octocat/Hello-World/pull/123"
+```
+
 Note for reasoning models (e.g. DeepSeek reasoner variants): `max_tokens`
 counts hidden reasoning tokens, so a large share of `maxResponseTokens` can
 be consumed before any visible output appears. Two mitigations: raise
@@ -234,6 +251,7 @@ to `review.systemPrompt`, which reliably stops empty responses.
 | `-diff`        | empty        | review a local unified diff or .patch file instead of fetching (review mode) |
 | `-diff-token`  | empty        | the ?token= value from a private .patch/.diff link (overrides github.diffToken) |
 | `-repo`        | current dir  | path to a local clone of the repo to diff with git (falls back to API) |
+| `-prompt-file` | empty        | read the prompt from this text file (chat: the message; review: overrides `review.systemPrompt`) |
 | `-log-file`    | empty        | append structured JSON logs to this file               |
 | `-debug`       | `false`      | Info level + HTTP-level detail (sanitized URLs, status codes, durations) |
 | `-quiet`       | `false`      | errors and warnings only                               |

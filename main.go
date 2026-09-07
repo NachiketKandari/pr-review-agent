@@ -5,6 +5,10 @@
 // Branch review: go run . "source_branch" "target_branch" [-flags]
 // PR review: go run . "https://github.com/owner/repo/pull/N" [-flags]
 //
+// -prompt-file reads the prompt text from a file instead of the command
+// line: it is the chat message in chat mode, and overrides
+// review.systemPrompt (the review instructions) in review mode.
+//
 // Branch review diffs merge-base(target)...source inside a local git clone
 // (the current directory or -repo), so no PR link and no API token are
 // needed. In review mode the diff is split into chunks, reviewed with a
@@ -48,6 +52,7 @@ func main() {
 	outputPath := flag.String("output", "", "write the review to this file (review mode)")
 	diffPath := flag.String("diff", "", "review a local unified diff file instead of fetching from GitHub")
 	diffToken := flag.String("diff-token", "", "the ?token= value GitHub puts on private .patch/.diff links (overrides github.diffToken)")
+	promptFile := flag.String("prompt-file", "", "read the prompt from this text file (chat mode: the message; review mode: overrides review.systemPrompt)")
 	repoDir := flag.String("repo", "", "path to a local clone of the repo; required for branch review, and used to diff PRs with git instead of the API (default: try the current directory)")
 	chunkTokens := flag.Int("chunk-tokens", 0, "override review.maxChunkTokens (review mode)")
 	logFile := flag.String("log-file", "", "also append structured JSON logs to this file")
@@ -69,11 +74,12 @@ func main() {
 	defer cleanupLog()
 
 	args := flag.Args()
-	if len(args) == 0 && *diffPath == "" {
+	if len(args) == 0 && *diffPath == "" && *promptFile == "" {
 		fmt.Fprintln(os.Stderr, `usage:
   go run . [flags] "source_branch" "target_branch"        review a branch merge
   go run . [flags] "https://github.com/owner/repo/pull/N" review a pull request
-  go run . [flags] "your message"                         chat`)
+  go run . [flags] "your message"                         chat
+  go run . [flags] -prompt-file prompt.txt                chat with a prompt from a file`)
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -89,25 +95,40 @@ func main() {
 		diffPath:    *diffPath,
 		diffToken:   *diffToken,
 		repoDir:     *repoDir,
+		promptFile:  *promptFile,
 	}
 
 	// A first argument that parses as a GitHub PR URL selects PR review
 	// mode (kept as a fallback); -diff reviews a local diff file (the URL
 	// is then optional context); two branch names select branch review.
-	if ref, err := diff.ParseURL(args[0]); err == nil {
-		runReview(flags, ref)
-		return
-	}
-	if *diffPath != "" {
+	// -prompt-file supplies the prompt text: the review instructions in
+	// review mode, the chat message otherwise.
+	if len(args) > 0 {
+		if ref, err := diff.ParseURL(args[0]); err == nil {
+			runReview(flags, ref)
+			return
+		}
+		if len(args) >= 2 && !strings.ContainsAny(args[0], " \t") && !strings.ContainsAny(args[1], " \t") {
+			runBranchReview(flags, args[0], args[1])
+			return
+		}
+	} else if *diffPath != "" {
 		runReview(flags, diff.Ref{})
-		return
-	}
-	if len(args) >= 2 && !strings.ContainsAny(args[0], " \t") && !strings.ContainsAny(args[1], " \t") {
-		runBranchReview(flags, args[0], args[1])
 		return
 	}
 
 	prompt := strings.Join(args, " ")
+	if flags.promptFile != "" {
+		content, err := readPromptFile(flags.promptFile)
+		if err != nil {
+			fatal(err)
+		}
+		if prompt != "" {
+			xlog.Warn("prompt file takes precedence over the positional message",
+				"prompt_file", flags.promptFile)
+		}
+		prompt = content
+	}
 	runChat(*configPath, *modelSel, *noStream, *insecure, *caPath, *timeout, prompt)
 }
 
@@ -122,6 +143,23 @@ type cfgFlags struct {
 	diffPath    string
 	diffToken   string
 	repoDir     string
+	promptFile  string
+}
+
+// readPromptFile reads the prompt text from path. Surrounding whitespace is
+// trimmed so a trailing newline in the file does not become part of the
+// prompt, and an empty file is rejected early with a clear error.
+func readPromptFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read prompt file %q: %w", path, err)
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return "", fmt.Errorf("prompt file %q is empty", path)
+	}
+	xlog.Info("prompt file loaded", "path", path, "chars", len(text))
+	return text, nil
 }
 
 // reviewKit bundles everything a review run needs: config (for GitHub
@@ -184,10 +222,19 @@ func startReview(f cfgFlags) (*reviewKit, error) {
 	if f.chunkTokens > 0 {
 		maxChunk = f.chunkTokens
 	}
+	// -prompt-file overrides the configured review instructions.
+	systemPrompt := cfg.Review.SystemPrompt
+	if f.promptFile != "" {
+		text, err := readPromptFile(f.promptFile)
+		if err != nil {
+			return nil, err
+		}
+		systemPrompt = text
+	}
 	agent, err := review.New(review.Options{
 		Model:             model.Model,
 		Client:            client,
-		SystemPrompt:      cfg.Review.SystemPrompt,
+		SystemPrompt:      systemPrompt,
 		ChunkPrompt:       cfg.Review.ChunkPrompt,
 		MergePrompt:       cfg.Review.MergePrompt,
 		MaxChunkTokens:    maxChunk,
