@@ -15,21 +15,31 @@ const gitEnv = "GIT_TERMINAL_PROMPT=0"
 
 var gitEnvPairs = []string{gitEnv, "GCM_INTERACTIVE=never"}
 
-// RepoMatches reports whether the git clone at dir has origin pointing at
-// ref's repository (same host, owner, and repo). It uses only local
-// metadata plus one remote query, and never needs an API token.
-func RepoMatches(ctx context.Context, dir string, ref Ref) error {
+// OriginRepo identifies the repository of the clone at dir from its origin
+// remote URL (host, owner, repo). It uses only local metadata, never
+// contacts the network, and never needs an API token.
+func OriginRepo(ctx context.Context, dir string) (Ref, error) {
 	out, err := gitRun(ctx, dir, "remote", "get-url", "origin")
 	if err != nil || strings.TrimSpace(out) == "" {
-		return fmt.Errorf("%s is not a git clone with an origin remote", dir)
+		return Ref{}, fmt.Errorf("%s is not a git clone with an origin remote", dir)
 	}
 	host, owner, repo, ok := parseOrigin(out)
 	if !ok {
-		return fmt.Errorf("cannot parse origin URL %q", out)
+		return Ref{}, fmt.Errorf("cannot parse origin URL %q", out)
 	}
-	if !strings.EqualFold(host, ref.Host) || !strings.EqualFold(owner, ref.Owner) || !strings.EqualFold(repo, ref.Repo) {
+	return Ref{Host: host, Owner: owner, Repo: repo}, nil
+}
+
+// RepoMatches reports whether the git clone at dir has origin pointing at
+// ref's repository (same host, owner, and repo).
+func RepoMatches(ctx context.Context, dir string, ref Ref) error {
+	orepo, err := OriginRepo(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(orepo.Host, ref.Host) || !strings.EqualFold(orepo.Owner, ref.Owner) || !strings.EqualFold(orepo.Repo, ref.Repo) {
 		return fmt.Errorf("origin %s/%s (%s) does not match %s/%s (%s)",
-			owner, repo, host, ref.Owner, ref.Repo, ref.Host)
+			orepo.Owner, orepo.Repo, orepo.Host, ref.Owner, ref.Repo, ref.Host)
 	}
 	return nil
 }
@@ -62,6 +72,7 @@ func RepoDiff(ctx context.Context, dir string, ref Ref) ([]byte, Meta, error) {
 
 	meta := Meta{
 		HeadRef: "",
+		BaseRef: branch, // the default branch is the assumed merge target
 	}
 	msgs, err := gitRun(ctx, dir, "log", "-n", strconv.Itoa(maxCommitMsgs), "--format=%B", base+".."+headRef)
 	if err == nil {
@@ -155,4 +166,74 @@ func parseOrigin(raw string) (host, owner, repo string, ok bool) {
 		return "", "", "", false
 	}
 	return strings.ToLower(host), parts[0], parts[1], true
+}
+
+// fetchBranch refreshes origin/<branch> from the remote. Failure is not
+// fatal: the branch may exist only locally, or the remote may be
+// unreachable, and resolution falls back to local refs.
+func fetchBranch(ctx context.Context, dir, branch string) {
+	if _, err := gitRun(ctx, dir, "fetch", "--quiet", "origin", branch); err != nil {
+		xlog.Debug("branch fetch failed; will try local refs",
+			"dir", dir, "branch", branch, "error", err)
+		return
+	}
+	xlog.Info("fetched branch from origin", "branch", branch, "dir", dir)
+}
+
+// resolveBranch resolves a branch name to a concrete ref inside the clone,
+// preferring the remote-tracking ref (origin/<branch>, freshly fetched,
+// which is what a GitHub PR would merge) and falling back to the local
+// branch. Branches that exist only locally or only remotely both resolve.
+func resolveBranch(ctx context.Context, dir, branch string) (string, error) {
+	for _, ref := range []string{"origin/" + branch, branch} {
+		out, err := gitRun(ctx, dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+		if err == nil && strings.TrimSpace(out) != "" {
+			xlog.Info("branch resolved", "branch", branch, "ref", ref, "commit", strings.TrimSpace(out))
+			return ref, nil
+		}
+	}
+	return "", fmt.Errorf("branch %q not found locally or on origin", branch)
+}
+
+// BranchDiff produces the review diff and context for merging source into
+// target inside the clone at dir, without a pull request or API token: it
+// fetches both branches from origin (best effort), resolves each one, then
+// diffs merge-base(target)...source (the same three-dot shape as a GitHub
+// PR diff) and gathers commit messages from target..source. Auth is
+// whatever git itself uses (SSH key, Git Credential Manager, ...).
+func BranchDiff(ctx context.Context, dir, source, target string) ([]byte, Meta, error) {
+	fetchBranch(ctx, dir, source)
+	fetchBranch(ctx, dir, target)
+
+	srcRef, err := resolveBranch(ctx, dir, source)
+	if err != nil {
+		return nil, Meta{}, fmt.Errorf("resolve source branch: %w", err)
+	}
+	tgtRef, err := resolveBranch(ctx, dir, target)
+	if err != nil {
+		return nil, Meta{}, fmt.Errorf("resolve target branch: %w", err)
+	}
+
+	out, err := gitRun(ctx, dir, "diff", "--no-ext-diff", tgtRef+"..."+srcRef)
+	if err != nil {
+		return nil, Meta{}, fmt.Errorf("diff %s into %s: %w", srcRef, tgtRef, err)
+	}
+
+	meta := Meta{
+		HeadRef: source,
+		BaseRef: target,
+	}
+	msgs, err := gitRun(ctx, dir, "log", "-n", strconv.Itoa(maxCommitMsgs), "--format=%B", tgtRef+".."+srcRef)
+	if err == nil {
+		for _, m := range strings.Split(msgs, "\n\n") {
+			if t := strings.TrimSpace(m); t != "" {
+				meta.Commits = append(meta.Commits, t)
+			}
+		}
+	}
+	if len(meta.Commits) == 0 {
+		xlog.Debug("no commit messages gathered for the branch range",
+			"source", source, "target", target)
+	}
+	return []byte(out), meta, nil
 }

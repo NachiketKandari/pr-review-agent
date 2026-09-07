@@ -171,7 +171,7 @@ func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, bac
 			"pr", ref.String(), "chunk", c.Index, "total", c.Total,
 			"files", strings.Join(c.Files, ","), "tokens", c.Tokens)
 
-		outText, err := a.chat(ctx, a.buildMessages(c, enrichment), a.model)
+		outText, err := a.chat(ctx, a.buildMessages(c, enrichment))
 		if err != nil {
 			return "", fmt.Errorf("chunk %d/%d review failed: %w", c.Index, c.Total, err)
 		}
@@ -278,10 +278,10 @@ func (a *Agent) streamMerge(ctx context.Context, ref diff.Ref, parts []string, o
 }
 
 // chat performs one non-streamed, response-capped model call.
-func (a *Agent) chat(ctx context.Context, messages []llm.Message, model string) (string, error) {
+func (a *Agent) chat(ctx context.Context, messages []llm.Message) (string, error) {
 	start := time.Now()
 	out, err := a.client.Chat(ctx, llm.ChatRequest{
-		Model:       model,
+		Model:       a.model,
 		Messages:    messages,
 		MaxTokens:   a.maxResponse,
 		Temperature: floatPtr(a.temperature),
@@ -289,14 +289,14 @@ func (a *Agent) chat(ctx context.Context, messages []llm.Message, model string) 
 	if err != nil {
 		return "", err
 	}
-	xlog.Debug("model chat complete", "model", model,
+	xlog.Debug("model chat complete", "model", a.model,
 		"duration_ms", time.Since(start).Milliseconds(), "chars", len(out))
 	return out, nil
 }
 
 // mergeChat performs a non-streamed merge of one budget-sized group.
 func (a *Agent) mergeChat(ctx context.Context, group []string) (string, error) {
-	return a.chat(ctx, a.buildMergeMessages(group), a.model)
+	return a.chat(ctx, a.buildMergeMessages(group))
 }
 
 // systemText returns the system prompt with the PR intent context appended

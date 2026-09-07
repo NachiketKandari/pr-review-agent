@@ -39,8 +39,17 @@ type Ref struct {
 	Number int
 }
 
-// String returns a compact, log-friendly "owner/repo#N" form.
-func (r Ref) String() string { return fmt.Sprintf("%s/%s#%d", r.Owner, r.Repo, r.Number) }
+// String returns a compact, log-friendly form: "owner/repo#N" for pull
+// requests; without a PR number (branch review mode) "owner/repo@host".
+func (r Ref) String() string {
+	if r.Number > 0 {
+		return fmt.Sprintf("%s/%s#%d", r.Owner, r.Repo, r.Number)
+	}
+	if r.Host == "" {
+		return fmt.Sprintf("%s/%s", r.Owner, r.Repo)
+	}
+	return fmt.Sprintf("%s/%s@%s", r.Owner, r.Repo, r.Host)
+}
 
 // GitHubURL returns the canonical pull-request page URL.
 func (r Ref) GitHubURL() string {
@@ -264,11 +273,12 @@ func trimPatchTail(sec string) string {
 }
 
 // Meta carries the read-only PR context used to make the review aware of
-// intent: title, description, head branch, and commit messages.
+// intent: title, description, head and base branches, and commit messages.
 type Meta struct {
 	Title   string
 	Body    string
 	HeadRef string
+	BaseRef string
 	Commits []string
 }
 
@@ -292,6 +302,9 @@ func fetchMeta(ctx context.Context, ref Ref, token string, hc *http.Client, base
 		Head  struct {
 			Ref string `json:"ref"`
 		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if err := json.Unmarshal(pullBody, &pull); err != nil {
 		return Meta{}, fmt.Errorf("decode PR metadata for %s: %w", ref.String(), err)
@@ -300,6 +313,7 @@ func fetchMeta(ctx context.Context, ref Ref, token string, hc *http.Client, base
 	m := Meta{
 		Title:   strings.TrimSpace(pull.Title),
 		HeadRef: pull.Head.Ref,
+		BaseRef: pull.Base.Ref,
 	}
 	if pull.Body != nil {
 		m.Body = strings.TrimSpace(*pull.Body)

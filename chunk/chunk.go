@@ -178,29 +178,25 @@ func hunkRanges(text string) []hunkRange {
 }
 
 // splitLines hard-splits text into line-aligned pieces of at most max
-// tokens. Each piece except the last is allowed to slightly exceed the
-// budget only when a single line alone is oversized.
+// tokens. A single line longer than the budget becomes its own piece.
 func splitLines(path, text string, max int) []piece {
-	var pieces []piece
-	start := 0
-	acc := 0
-	flush := func(end int, cur int) {
-		sub := strings.Join(strings.Split(text, "\n")[start:end], "\n")
-		pieces = append(pieces, piece{path: path, text: sub, tokens: cur})
-		start = end
-		acc = 0
-	}
 	lines := strings.Split(text, "\n")
+	var pieces []piece
+	start, acc := 0, 0
+	flush := func(end int) {
+		sub := strings.Join(lines[start:end], "\n")
+		pieces = append(pieces, piece{path: path, text: sub, tokens: EstimateTokens(sub)})
+		start, acc = end, 0
+	}
 	for i, ln := range lines {
 		t := len(ln) + 1 // account for the newline
 		if acc > 0 && acc+t > max*4 {
-			flush(i, acc/4)
+			flush(i)
 		}
 		acc += t
 	}
 	if start < len(lines) {
-		sub := strings.Join(lines[start:], "\n")
-		pieces = append(pieces, piece{path: path, text: sub, tokens: EstimateTokens(sub)})
+		flush(len(lines))
 	}
 	return pieces
 }

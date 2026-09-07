@@ -56,8 +56,30 @@ go run . -config config.yaml "Hello"           # use a different config file
 
 ### Review mode
 
-A first argument that parses as a GitHub PR URL switches to review mode
-(Go `flag` parsing means flags come before the URL):
+#### Branch review (primary form)
+
+Give the source branch (the one being merged) and the target branch (the
+one being merged into). The tool works inside a local git clone — run it
+from the repository, or point `-repo` at one — fetches both branches from
+origin with git itself (your existing SSH key / credential manager
+authenticates; no API token and no PR link involved), then diffs
+merge-base(target)...source, the same three-dot shape as a GitHub PR diff:
+
+```sh
+go run . "feature/auth" "main"               # review feature/auth into main
+go run . -repo /path/to/clone "fix" "release/v2"
+go run . -output review.md "my-branch" "main"  # also save to file
+```
+
+Branch resolution prefers the freshly fetched `origin/<branch>` (what a PR
+would actually merge) and falls back to the local branch, so branches that
+exist only locally or only remotely both work. Commit messages from
+`target..source` are added to the review context.
+
+#### PR review (fallback)
+
+A first argument that parses as a GitHub PR URL still switches to PR review
+mode (Go `flag` parsing means flags come before the URL):
 
 ```sh
 go run . "https://github.com/octocat/Hello-World/pull/123"
@@ -241,7 +263,7 @@ fatal path logs a structured error with package/PR/chunk context.
 main.go            CLI entry point: chat + review mode, flag wiring
 config/            Continue-style yaml parsing and model selection
 llm/               OpenAI-compatible HTTP client (chat, SSE streaming, models)
-diff/              PR URL parsing, GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing
+diff/              PR URL parsing, branch review (local git diff), GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing
 chunk/             len/4 token estimation, greedy chunk building
 review/            map-reduce review agent (prompts, chunk reviews, merges)
 xlog/              slog setup (stderr + JSON file), URL/token redaction
@@ -249,6 +271,7 @@ xlog/              slog setup (stderr + JSON file), URL/token redaction
 
 ## Roadmap
 
+- [x] `go run . "source_branch" "target_branch"` to review a branch merge from a local clone (no token needed)
 - [x] `go run . "pr-link"` to fetch a PR diff and review it
 - [x] Chunked review of large diffs
 - [x] GitHub Enterprise hosts and read-only PR intent context (title, description, commit messages)
