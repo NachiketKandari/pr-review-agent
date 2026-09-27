@@ -195,6 +195,40 @@ func resolveBranch(ctx context.Context, dir, branch string) (string, error) {
 	return "", fmt.Errorf("branch %q not found locally or on origin", branch)
 }
 
+// CurrentBranch returns the name of the branch checked out in the clone at
+// dir. It is how the single-argument review form ("target_branch") learns
+// which branch is under review, so the user never has to name it.
+func CurrentBranch(ctx context.Context, dir string) (string, error) {
+	if out, err := gitRun(ctx, dir, "branch", "--show-current"); err == nil {
+		if b := strings.TrimSpace(out); b != "" {
+			return b, nil
+		}
+	}
+	// Detached HEAD or an older git: fall back to rev-parse.
+	out, err := gitRun(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("cannot determine the current branch in %s: %w", dir, err)
+	}
+	if b := strings.TrimSpace(out); b != "" && b != "HEAD" {
+		return b, nil
+	}
+	return "", fmt.Errorf("HEAD is detached in %s; name the source branch explicitly", dir)
+}
+
+// IsGitRepo reports whether dir sits inside a git working tree.
+func IsGitRepo(ctx context.Context, dir string) bool {
+	out, err := gitRun(ctx, dir, "rev-parse", "--is-inside-work-tree")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// RefExists reports whether name (branch, tag, or other ref) resolves to a
+// commit in the clone at dir. Used to tell a branch-review argument apart
+// from a chat message without ever guessing.
+func RefExists(ctx context.Context, dir, name string) bool {
+	out, err := gitRun(ctx, dir, "rev-parse", "--verify", "--quiet", name+"^{commit}")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
 // BranchDiff produces the review diff and context for merging source into
 // target inside the clone at dir, without a pull request or API token: it
 // fetches both branches from origin (best effort), resolves each one, then

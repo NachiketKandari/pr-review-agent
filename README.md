@@ -74,9 +74,17 @@ merge-base(target)...source, the same three-dot shape as a GitHub PR diff:
 
 ```sh
 go run . "feature/auth" "main"               # review feature/auth into main
+go run . "main"                             # review the current branch into main
 go run . -repo /path/to/clone "fix" "release/v2"
 go run . -output review.md "my-branch" "main"  # also save to file
 ```
+
+The single-branch form reviews the branch you have checked out into the
+target branch — the common case when you are sitting on your feature branch
+and want it reviewed against `main`. The source branch is resolved with
+`git branch --show-current` (falling back to `git rev-parse`), and the
+argument must be a real ref, so a lone chat message is never misread as a
+branch review (outside a git clone it stays a chat).
 
 Branch resolution prefers the freshly fetched `origin/<branch>` (what a PR
 would actually merge) and falls back to the local branch, so branches that
@@ -127,9 +135,15 @@ The diff is obtained in this order of preference:
    PR metadata (Bearer auth when a token is available).
 
 The flow then continues: split the diff into chunks (greedy at file
-boundaries, then hunks, then lines) → review each chunk with one capped
-model call → merge findings, recursively when they overflow the context
-budget → stream the final merged review to stdout. The PR title,
+boundaries; oversized files split at function boundaries — consecutive
+`@@` hunks git attributes to the same function — then at hunk boundaries,
+then at lines as a last resort) → review each chunk with one capped model
+call → weave each file's chunk findings into one per-file review
+(preserving cross-function context inside the file) → merge the file
+reviews, recursively when they overflow the context budget → stream the
+final merged review to stdout. Chunk and response budgets default to
+10000/4000, tuned for a 16K-context model (~10K input + 4K response + ~2K
+headroom for the system prompt and PR intent). The PR title,
 description, and commit messages are injected into every prompt as "Pull
 request intent" so the review knows what the change is supposed to achieve.
 
@@ -206,10 +220,11 @@ review:
   model: deepseek-v4-flash      # optional override (else -model flag, else first model)
   systemPrompt: |
     You are a senior code reviewer. Focus on correctness, security, ...
-  chunkPrompt: ""               # default in code; placeholders: {{index}} {{total}} {{files}} {{diff}} {{responseTokens}}
+  chunkPrompt: ""               # default in code; placeholders: {{index}} {{total}} {{files}} {{functions}} {{diff}} {{responseTokens}}
+  filePrompt: ""                # default in code; weaves one file's chunk findings; placeholders: {{file}} {{findings}}
   mergePrompt: ""               # default in code; placeholder: {{findings}}
-  maxChunkTokens: 8000          # chunk and merge context budget
-  maxResponseTokens: 2048
+  maxChunkTokens: 10000         # chunk and merge context budget (16K-tuned)
+  maxResponseTokens: 4000
   temperature: 0.2
 github:
   token: ""                     # optional; GITHUB_TOKEN env also honored
@@ -282,16 +297,17 @@ main.go            CLI entry point: chat + review mode, flag wiring
 config/            Continue-style yaml parsing and model selection
 llm/               OpenAI-compatible HTTP client (chat, SSE streaming, models)
 diff/              PR URL parsing, branch review (local git diff), GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing
-chunk/             len/4 token estimation, greedy chunk building
-review/            map-reduce review agent (prompts, chunk reviews, merges)
+chunk/             len/4 token estimation, greedy chunk building (file → function → hunk → line)
+review/            map-reduce review agent (prompts, chunk reviews, per-file weave, merges)
 xlog/              slog setup (stderr + JSON file), URL/token redaction
 ```
 
 ## Roadmap
 
 - [x] `go run . "source_branch" "target_branch"` to review a branch merge from a local clone (no token needed)
+- [x] `go run . "target_branch"` to review the current branch into the target branch (inside a git clone)
 - [x] `go run . "pr-link"` to fetch a PR diff and review it
-- [x] Chunked review of large diffs
+- [x] Chunked review of large diffs (function-aware chunking + per-file weave)
 - [x] GitHub Enterprise hosts and read-only PR intent context (title, description, commit messages)
 - [ ] Jira integration: detect the ticket key in the PR title/branch, fetch the
       ticket summary/description, and feed the acceptance goal into the review

@@ -73,8 +73,8 @@ func TestNewValidationAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.maxChunk != 8000 || a.maxResponse != 2048 {
-		t.Errorf("defaults = chunk %d resp %d, want 8000/2048", a.maxChunk, a.maxResponse)
+	if a.maxChunk != 10000 || a.maxResponse != 4000 {
+		t.Errorf("defaults = chunk %d resp %d, want 10000/4000", a.maxChunk, a.maxResponse)
 	}
 	if a.temperature != 0.2 {
 		t.Errorf("temperature = %v, want 0.2", a.temperature)
@@ -125,8 +125,8 @@ func TestReviewSingleChunkStreamsFinalMerge(t *testing.T) {
 			if call != 0 {
 				t.Errorf("expected only one Chat call, got #%d", call)
 			}
-			if req.MaxTokens != 2048 {
-				t.Errorf("MaxTokens = %d, want 2048", req.MaxTokens)
+			if req.MaxTokens != 4000 {
+				t.Errorf("MaxTokens = %d, want 4000", req.MaxTokens)
 			}
 			if req.Temperature == nil || *req.Temperature != 0.2 {
 				t.Errorf("temperature = %v, want 0.2", req.Temperature)
@@ -376,4 +376,98 @@ type enrichFunc func(ctx context.Context, files []diff.File) (string, error)
 
 func (f enrichFunc) Enrich(ctx context.Context, files []diff.File) (string, error) {
 	return f(ctx, files)
+}
+
+func TestReviewFileMergeWeavesSameFileChunks(t *testing.T) {
+	// One file split into two chunks must trigger exactly one file-merge
+	// Chat call whose prompt names the file and carries both findings.
+	fake := &fakeLLM{
+		chatResp: func(call int, req llm.ChatRequest) (string, error) {
+			switch call {
+			case 0, 1:
+				return "## chunk findings", nil
+			case 2:
+				msg, _ := req.Messages[1].Content.(string)
+				if !strings.Contains(msg, "a.go") {
+					t.Errorf("file merge prompt missing file name: %q", msg)
+				}
+				if strings.Count(msg, "## chunk findings") != 2 {
+					t.Errorf("file merge prompt should carry both findings, got: %q", msg)
+				}
+				return "## file review", nil
+			default:
+				t.Errorf("unexpected Chat call #%d", call)
+				return "", nil
+			}
+		},
+		streamResp: func(call int, req llm.ChatRequest) (string, error) {
+			return "## final review", nil
+		},
+	}
+	// medFile is ~415 tokens with a single hunk; at budget 300 it splits
+	// at lines into 2 chunks of the same file.
+	a, err := New(Options{Model: "m", Client: fake, MaxChunkTokens: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	text, err := a.Review(context.Background(), testRef(), []diff.File{medFile("a.go")}, "", &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.chatCalls) != 3 {
+		t.Errorf("Chat calls = %d, want 3 (2 chunk + 1 file merge)", len(fake.chatCalls))
+	}
+	if len(fake.streamCalls) != 1 {
+		t.Errorf("StreamChat calls = %d, want 1 (final merge)", len(fake.streamCalls))
+	}
+	if text != "## final review" || out.String() != "## final review" {
+		t.Errorf("final text = %q, want %q", text, "## final review")
+	}
+}
+
+func TestReviewFileMergeSkippedForSingleChunkFile(t *testing.T) {
+	fake := &fakeLLM{
+		chatResp: func(call int, req llm.ChatRequest) (string, error) {
+			if call != 0 {
+				t.Errorf("expected only one Chat call, got #%d", call)
+			}
+			return "## chunk findings", nil
+		},
+		streamResp: func(call int, req llm.ChatRequest) (string, error) {
+			return "## final review", nil
+		},
+	}
+	a, err := New(Options{Model: "m", Client: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := a.Review(context.Background(), testRef(), []diff.File{smallFile("a.go")}, "", &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.chatCalls) != 1 {
+		t.Errorf("Chat calls = %d, want 1 (no file merge for a single-chunk file)", len(fake.chatCalls))
+	}
+}
+
+func TestGroupByFileOrderAndSharing(t *testing.T) {
+	findings := []chunkFinding{
+		{chunk: chunk.Chunk{Files: []string{"a.go"}}, text: "fa"},
+		{chunk: chunk.Chunk{Files: []string{"b.go", "c.go"}}, text: "fbc"},
+		{chunk: chunk.Chunk{Files: []string{"a.go"}}, text: "fa2"},
+	}
+	groups := groupByFile(findings)
+	if len(groups) != 3 {
+		t.Fatalf("got %d groups, want 3", len(groups))
+	}
+	if groups[0].file != "a.go" || len(groups[0].texts) != 2 || groups[0].texts[0] != "fa" || groups[0].texts[1] != "fa2" {
+		t.Errorf("a.go group = %+v", groups[0])
+	}
+	if groups[1].file != "b.go" || len(groups[1].texts) != 1 {
+		t.Errorf("b.go group = %+v", groups[1])
+	}
+	if groups[2].file != "c.go" || len(groups[2].texts) != 1 {
+		t.Errorf("c.go group = %+v", groups[2])
+	}
 }

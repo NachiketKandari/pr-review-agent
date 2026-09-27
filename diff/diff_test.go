@@ -333,3 +333,63 @@ func TestFetchMetaNullBodyAndError(t *testing.T) {
 		t.Errorf("error = %q", err)
 	}
 }
+
+func TestParseDiffSplitsHunksWithSymbols(t *testing.T) {
+	raw := `diff --git a/main.go b/main.go
+index 1111111..2222222 100644
+--- a/main.go
++++ b/main.go
+@@ -1,3 +1,4 @@ package main
+ package main
++
++import "fmt"
+@@ -10,5 +11,6 @@ func alpha() {
+ func alpha() {
+-	return 1
++	return 2
+ }
++// trailing comment
+@@ -20,3 +22,4 @@ func beta() {
+ func beta() {
+-	x := 1
++	x := 2
++	y := 3
+ }
+`
+	files := ParseDiff([]byte(raw))
+	if len(files) != 1 {
+		t.Fatalf("got %d files, want 1", len(files))
+	}
+	f := files[0]
+	if len(f.Hunks) != 3 {
+		t.Fatalf("got %d hunks, want 3", len(f.Hunks))
+	}
+	if f.Hunks[1].Symbol != "func alpha() {" {
+		t.Errorf("hunk 1 symbol = %q, want %q", f.Hunks[1].Symbol, "func alpha() {")
+	}
+	if f.Hunks[2].Symbol != "func beta() {" {
+		t.Errorf("hunk 2 symbol = %q, want %q", f.Hunks[2].Symbol, "func beta() {")
+	}
+	// The first hunk keeps the diff headers so a lone hunk stays self-describing.
+	if !strings.HasPrefix(f.Hunks[0].Text, "diff --git a/main.go b/main.go") {
+		t.Errorf("first hunk lost the diff headers: %q", f.Hunks[0].Text[:40])
+	}
+	if !strings.Contains(f.Hunks[0].Text, "@@ -1,3 +1,4 @@") {
+		t.Errorf("first hunk lost its @@ header: %q", f.Hunks[0].Text)
+	}
+}
+
+func TestHunkSymbolExtraction(t *testing.T) {
+	cases := []struct{ header, want string }{
+		{"@@ -1418,6 +1418,13 @@ func (c *Command) LocalFlags() *flag.FlagSet", "func (c *Command) LocalFlags() *flag.FlagSet"},
+		{"@@ -1,3 +1,4 @@ package main", "package main"},
+		{"@@ -1,3 +1,4 @@", ""},
+		{"@@ -1,3 +1,4 @@   ", ""},
+		{"not a hunk header", ""},
+	}
+	for _, tc := range cases {
+		if got := hunkSymbol(tc.header); got != tc.want {
+			t.Errorf("hunkSymbol(%q) = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+}

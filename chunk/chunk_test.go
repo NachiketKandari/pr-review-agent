@@ -194,3 +194,73 @@ func TestBuildEdgeCases(t *testing.T) {
 		t.Errorf("binary and empty files produced %d chunks, want 0", len(chunks))
 	}
 }
+
+func TestSplitBySymbolGroupsSameFunction(t *testing.T) {
+	// Two hunks of func alpha and one of func beta, all over budget when
+	// combined but each function group fitting on its own.
+	hunk := func(symbol, body string) diff.Hunk {
+		var b strings.Builder
+		b.WriteString("@@ -1,3 +1,4 @@ " + symbol + "\n")
+		b.WriteString(body)
+		return diff.Hunk{Symbol: symbol, Text: b.String()}
+	}
+	big := strings.Repeat("x = 1 // padding to exceed the per-piece budget\n", 40)
+	f := diff.File{
+		Path: "a.go",
+		Hunks: []diff.Hunk{
+			hunk("func alpha() {", "line a1\n"+big),
+			hunk("func alpha() {", "line a2\n"+big),
+			hunk("func beta() {", "line b1\n"+big),
+		},
+	}
+	f.Text = f.Hunks[0].Text + "\n" + f.Hunks[1].Text + "\n" + f.Hunks[2].Text
+
+	chunks, err := Build([]diff.File{f}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2 (alpha group, beta group)", len(chunks))
+	}
+	if got := strings.Join(chunks[0].Functions, ","); got != "func alpha() {" {
+		t.Errorf("chunk 1 functions = %q, want only func alpha", got)
+	}
+	if got := strings.Join(chunks[1].Functions, ","); got != "func beta() {" {
+		t.Errorf("chunk 2 functions = %q, want only func beta", got)
+	}
+	if !strings.Contains(chunks[0].Text, "line a1") || !strings.Contains(chunks[0].Text, "line a2") {
+		t.Errorf("chunk 1 should contain both alpha hunks")
+	}
+}
+
+func TestSplitBySymbolFallsBackToHunksForOversizedFunction(t *testing.T) {
+	hunk := func(symbol, body string) diff.Hunk {
+		var b strings.Builder
+		b.WriteString("@@ -1,3 +1,4 @@ " + symbol + "\n")
+		b.WriteString(body)
+		return diff.Hunk{Symbol: symbol, Text: b.String()}
+	}
+	big := strings.Repeat("y = 2 // padding\n", 120)
+	f := diff.File{
+		Path: "b.go",
+		Hunks: []diff.Hunk{
+			hunk("func gamma() {", "line g1\n"+big),
+			hunk("func gamma() {", "line g2\n"+big),
+		},
+	}
+	f.Text = f.Hunks[0].Text + "\n" + f.Hunks[1].Text
+
+	// Each hunk fits alone (~480 tokens), the pair does not.
+	chunks, err := Build([]diff.File{f}, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2 (one per hunk)", len(chunks))
+	}
+	for _, c := range chunks {
+		if len(c.Functions) != 1 || c.Functions[0] != "func gamma() {" {
+			t.Errorf("chunk functions = %v, want [func gamma() {]", c.Functions)
+		}
+	}
+}

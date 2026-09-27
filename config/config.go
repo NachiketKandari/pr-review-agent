@@ -45,9 +45,10 @@ type Review struct {
 	Model             string  `yaml:"model"`             // optional override
 	SystemPrompt      string  `yaml:"systemPrompt"`      // "" = built-in default
 	ChunkPrompt       string  `yaml:"chunkPrompt"`       // "" = built-in default
+	FilePrompt        string  `yaml:"filePrompt"`        // "" = built-in default; weaves one file's chunk findings
 	MergePrompt       string  `yaml:"mergePrompt"`       // "" = built-in default
-	MaxChunkTokens    int     `yaml:"maxChunkTokens"`    // 0 = 8000
-	MaxResponseTokens int     `yaml:"maxResponseTokens"` // 0 = 2048
+	MaxChunkTokens    int     `yaml:"maxChunkTokens"`    // 0 = 10000 (16K-context tuning)
+	MaxResponseTokens int     `yaml:"maxResponseTokens"` // 0 = 4000
 	Temperature       float64 `yaml:"temperature"`       // 0 = 0.2
 }
 

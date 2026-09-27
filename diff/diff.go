@@ -439,6 +439,19 @@ type File struct {
 	Deletions int
 	Binary    bool
 	Text      string
+	// Hunks is the section split at @@ hunk boundaries. The first hunk
+	// keeps the diff headers so a lone hunk still carries the file path.
+	// Hunks is nil for binary diffs and for sections without @@ hunks.
+	Hunks []Hunk
+}
+
+// Hunk is one @@ hunk of a file diff. Symbol is the trailing function
+// context git prints on the @@ header line (e.g.
+// "func (c *Command) LocalFlags() *flag.FlagSet"); it is empty when git
+// could not determine one.
+type Hunk struct {
+	Symbol string
+	Text   string
 }
 
 // ParseDiff splits a unified diff into per-file sections. Each section is
@@ -505,7 +518,52 @@ func parseSection(sec string) File {
 	if f.Path == "" {
 		f.Path = pathsFromDiffGit(sec).new
 	}
+	f.Hunks = parseHunks(sec)
 	return f
+}
+
+// parseHunks splits a file section at @@ hunk boundaries. The @@ header's
+// trailing text (the function the hunk belongs to) becomes the hunk's
+// symbol. The diff headers stay attached to the first hunk so a lone hunk
+// still carries the file path.
+func parseHunks(sec string) []Hunk {
+	lines := strings.Split(sec, "\n")
+	var starts []int
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "@@") {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) == 0 {
+		return nil
+	}
+	out := make([]Hunk, 0, len(starts))
+	for i, s := range starts {
+		from, end := s, len(lines)
+		if i == 0 {
+			from = 0 // keep the diff headers with the first hunk
+		}
+		if i+1 < len(starts) {
+			end = starts[i+1]
+		}
+		out = append(out, Hunk{
+			Symbol: hunkSymbol(lines[s]),
+			Text:   strings.Join(lines[from:end], "\n"),
+		})
+	}
+	return out
+}
+
+// hunkSymbol extracts the trailing function context from a @@ header line,
+// e.g. "@@ -1418,6 +1418,13 @@ func (c *Command) LocalFlags() *flag.FlagSet"
+// yields "func (c *Command) LocalFlags() *flag.FlagSet".
+func hunkSymbol(header string) string {
+	rest := strings.TrimPrefix(header, "@@")
+	i := strings.Index(rest, "@@")
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[i+2:])
 }
 
 type paths struct{ old, new string }

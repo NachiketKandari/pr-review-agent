@@ -77,9 +77,13 @@ func main() {
 	if len(args) == 0 && *diffPath == "" && *promptFile == "" {
 		fmt.Fprintln(os.Stderr, `usage:
   go run . [flags] "source_branch" "target_branch"        review a branch merge
+  go run . [flags] "target_branch"                        review the current branch into target_branch (inside a git clone)
   go run . [flags] "https://github.com/owner/repo/pull/N" review a pull request
   go run . [flags] "your message"                         chat
-  go run . [flags] -prompt-file prompt.txt                chat with a prompt from a file`)
+  go run . [flags] -prompt-file prompt.txt                chat with a prompt from a file
+
+  Branch review uses the git auth already in your terminal (SSH key /
+  credential manager); it never reads a token from the YAML or env.`)
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -100,7 +104,10 @@ func main() {
 
 	// A first argument that parses as a GitHub PR URL selects PR review
 	// mode (kept as a fallback); -diff reviews a local diff file (the URL
-	// is then optional context); two branch names select branch review.
+	// is then optional context); two branch names select branch review; a
+	// single branch name inside a git clone reviews the current branch
+	// into that target branch (auth is whatever git itself uses — your
+	// SSH key / credential manager — never a token from the YAML).
 	// -prompt-file supplies the prompt text: the review instructions in
 	// review mode, the chat message otherwise.
 	if len(args) > 0 {
@@ -111,6 +118,12 @@ func main() {
 		if len(args) >= 2 && !strings.ContainsAny(args[0], " \t") && !strings.ContainsAny(args[1], " \t") {
 			runBranchReview(flags, args[0], args[1])
 			return
+		}
+		if len(args) == 1 && !strings.ContainsAny(args[0], " \t") {
+			if source, ok := currentBranchSource(flags.repoDir, args[0]); ok {
+				runBranchReview(flags, source, args[0])
+				return
+			}
 		}
 	} else if *diffPath != "" {
 		runReview(flags, diff.Ref{})
@@ -236,6 +249,7 @@ func startReview(f cfgFlags) (*reviewKit, error) {
 		Client:            client,
 		SystemPrompt:      systemPrompt,
 		ChunkPrompt:       cfg.Review.ChunkPrompt,
+		FilePrompt:        cfg.Review.FilePrompt,
 		MergePrompt:       cfg.Review.MergePrompt,
 		MaxChunkTokens:    maxChunk,
 		MaxResponseTokens: cfg.Review.MaxResponseTokens,
@@ -437,6 +451,28 @@ func runBranchReview(f cfgFlags, source, target string) {
 	}
 
 	finishReview(f, orepo, text, "source", source, "target", target)
+}
+
+// currentBranchSource resolves the checked-out branch of the repo at
+// repoDir for the single-argument branch-review form ("target_branch").
+// ok is false when the argument is not a real ref or repoDir is not a git
+// clone, so a lone chat message is never misread as a branch review.
+func currentBranchSource(repoDir, target string) (string, bool) {
+	dir := repoDir
+	if dir == "" {
+		dir = "."
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if !diff.IsGitRepo(ctx, dir) || !diff.RefExists(ctx, dir, target) {
+		return "", false
+	}
+	src, err := diff.CurrentBranch(ctx, dir)
+	if err != nil {
+		xlog.Warn("single-argument branch review fell back to chat", "err", err)
+		return "", false
+	}
+	return src, true
 }
 
 // parseAndLogDiff splits a unified diff into per-file sections and logs the

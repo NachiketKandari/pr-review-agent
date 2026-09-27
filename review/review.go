@@ -2,9 +2,10 @@
 // diffs.
 //
 // Map: each diff chunk is reviewed by a non-streamed, response-capped model
-// call. Reduce: chunk findings are merged — recursively when they overflow
-// the context budget — until a single final merge can be streamed to the
-// terminal.
+// call. File reduce: each file's chunk findings are woven into one file
+// review, preserving cross-function context inside the file. Final reduce:
+// file reviews are merged — recursively when they overflow the context
+// budget — until a single final merge can be streamed to the terminal.
 //
 // The model is accessed through the minimal [LLM] interface so tests can
 // substitute a fake; *llm.Client implements it directly.
@@ -23,7 +24,9 @@ import (
 	"github.com/NachiketKandari/pr-review-agent/xlog"
 )
 
-// Defaults applied when Options leave fields zero.
+// Defaults applied when Options leave fields zero. Chunk and response
+// budgets target a 16K-context model: ~10K input (chunk) + 4K response +
+// ~2K headroom for the system prompt and PR intent context.
 const (
 	defaultSystemPrompt = "You are a senior software engineer performing a code review of a GitHub pull request. " +
 		"Focus on correctness, security, concurrency, performance, and maintainability. " +
@@ -33,9 +36,17 @@ const (
 	defaultChunkPrompt = "Review the following chunk {{index}} of {{total}} from a pull request.\n" +
 		"Files in this chunk: {{files}}\n\n{{diff}}\n\n" +
 		"List concrete findings with file names. Keep the response under {{responseTokens}} tokens."
-	defaultMergePrompt = "Below are the per-chunk reviews of one pull request, separated by ---.\n" +
+	defaultFilePrompt = "The sections below are per-chunk reviews of a single file changed in a pull request, separated by ---.\n" +
+		"File: {{file}}\n\n" +
+		"Weave them into one coherent review of this file: merge duplicates, resolve contradictions, " +
+		"keep every substantive finding, and call out cross-function issues inside the file " +
+		"(duplicated logic, inconsistent error handling, API mismatches between changed functions). " +
+		"Format as Markdown.\n\n{{findings}}"
+	defaultMergePrompt = "Below are the per-file reviews of one pull request, separated by ---.\n" +
 		"Synthesize them into one deduplicated review. Merge duplicates, order findings by severity, " +
 		"and keep every substantive finding. Format as Markdown.\n\n{{findings}}"
+	defaultMaxChunkTokens    = 10000
+	defaultMaxResponseTokens = 4000
 )
 
 // LLM is the minimal model surface review needs. *llm.Client satisfies it.
@@ -61,10 +72,11 @@ type Options struct {
 	Enricher Enricher // optional; Phase 2 seam, nil by default
 
 	SystemPrompt      string  // "" = default
-	ChunkPrompt       string  // "" = default
+	ChunkPrompt       string  // "" = default; supports {{index}} {{total}} {{files}} {{functions}} {{diff}} {{responseTokens}}
+	FilePrompt        string  // "" = default; supports {{file}} {{findings}}
 	MergePrompt       string  // "" = default
-	MaxChunkTokens    int     // 0 = 8000; chunk and merge context budget
-	MaxResponseTokens int     // 0 = 2048; cap per model response
+	MaxChunkTokens    int     // 0 = 10000; chunk and merge context budget
+	MaxResponseTokens int     // 0 = 4000; cap per model response
 	Temperature       float64 // 0 = 0.2
 }
 
@@ -73,6 +85,7 @@ type Agent struct {
 	model        string
 	systemPrompt string
 	chunkPrompt  string
+	filePrompt   string
 	mergePrompt  string
 	maxChunk     int
 	maxResponse  int
@@ -95,6 +108,7 @@ func New(opts Options) (*Agent, error) {
 		model:        opts.Model,
 		systemPrompt: opts.SystemPrompt,
 		chunkPrompt:  opts.ChunkPrompt,
+		filePrompt:   opts.FilePrompt,
 		mergePrompt:  opts.MergePrompt,
 		maxChunk:     opts.MaxChunkTokens,
 		maxResponse:  opts.MaxResponseTokens,
@@ -110,16 +124,21 @@ func New(opts Options) (*Agent, error) {
 	} else if !strings.Contains(a.chunkPrompt, "{{diff}}") {
 		xlog.Warn("review.chunkPrompt is set but has no {{diff}} placeholder; the diff text will not be sent")
 	}
+	if a.filePrompt == "" {
+		a.filePrompt = defaultFilePrompt
+	} else if !strings.Contains(a.filePrompt, "{{findings}}") {
+		xlog.Warn("review.filePrompt is set but has no {{findings}} placeholder; chunk findings will not be sent")
+	}
 	if a.mergePrompt == "" {
 		a.mergePrompt = defaultMergePrompt
 	} else if !strings.Contains(a.mergePrompt, "{{findings}}") {
 		xlog.Warn("review.mergePrompt is set but has no {{findings}} placeholder; chunk findings will not be sent")
 	}
 	if a.maxChunk <= 0 {
-		a.maxChunk = 8000
+		a.maxChunk = defaultMaxChunkTokens
 	}
 	if a.maxResponse <= 0 {
-		a.maxResponse = 2048
+		a.maxResponse = defaultMaxResponseTokens
 	}
 	if a.temperature <= 0 {
 		a.temperature = 0.2
@@ -164,12 +183,13 @@ func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, bac
 	}
 
 	// Map: one capped, non-streamed review call per chunk.
-	findings := make([]string, 0, len(chunks))
+	findings := make([]chunkFinding, 0, len(chunks))
 	for _, c := range chunks {
 		start := time.Now()
 		xlog.Info("chunk review start",
 			"pr", ref.String(), "chunk", c.Index, "total", c.Total,
-			"files", strings.Join(c.Files, ","), "tokens", c.Tokens)
+			"files", strings.Join(c.Files, ","), "functions", strings.Join(c.Functions, ","),
+			"tokens", c.Tokens)
 
 		outText, err := a.chat(ctx, a.buildMessages(c, enrichment))
 		if err != nil {
@@ -184,7 +204,7 @@ func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, bac
 			"pr", ref.String(), "chunk", c.Index, "total", c.Total,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"response_chars", len(outText), "response_tokens_est", chunk.EstimateTokens(outText))
-		findings = append(findings, strings.TrimSpace(outText))
+		findings = append(findings, chunkFinding{chunk: c, text: strings.TrimSpace(outText)})
 	}
 
 	if len(findings) == 0 {
@@ -192,10 +212,26 @@ func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, bac
 		return "", nil
 	}
 
-	// Reduce: recursively merge until the combined findings fit the
+	// File reduce: weave each file's chunk findings into one file review so
+	// cross-function context inside the file survives to the final merge.
+	// A file with a single finding skips the extra model call.
+	fileParts := make([]string, 0, len(findings))
+	for _, g := range groupByFile(findings) {
+		if len(g.texts) == 1 {
+			fileParts = append(fileParts, g.texts[0])
+			continue
+		}
+		merged, err := a.mergeFile(ctx, ref, g.file, g.texts)
+		if err != nil {
+			return "", fmt.Errorf("merge file findings: %w", err)
+		}
+		fileParts = append(fileParts, merged)
+	}
+
+	// Reduce: recursively merge until the combined file reviews fit the
 	// context budget; the final merge streams to out.
 	start := time.Now()
-	finalText, err := a.reduce(ctx, ref, findings, out, 0)
+	finalText, err := a.reduce(ctx, ref, fileParts, out, 0)
 	if err != nil {
 		return "", fmt.Errorf("merge findings: %w", err)
 	}
@@ -204,6 +240,66 @@ func (a *Agent) Review(ctx context.Context, ref diff.Ref, files []diff.File, bac
 		"duration_ms", time.Since(start).Milliseconds(),
 		"output_chars", len(finalText), "output_tokens_est", chunk.EstimateTokens(finalText))
 	return finalText, nil
+}
+
+// chunkFinding pairs a chunk review's output with the chunk it came from.
+type chunkFinding struct {
+	chunk chunk.Chunk
+	text  string
+}
+
+// fileGroup is one file's chunk findings in chunk order.
+type fileGroup struct {
+	file  string
+	texts []string
+}
+
+// groupByFile assigns each chunk finding to every file its chunk covered,
+// in first-appearance order of the files. Chunks that span files contribute
+// their finding to each file's merge.
+func groupByFile(findings []chunkFinding) []fileGroup {
+	var order []string
+	byFile := map[string]*fileGroup{}
+	for _, f := range findings {
+		for _, file := range f.chunk.Files {
+			g, ok := byFile[file]
+			if !ok {
+				g = &fileGroup{file: file}
+				byFile[file] = g
+				order = append(order, file)
+			}
+			g.texts = append(g.texts, f.text)
+		}
+	}
+	out := make([]fileGroup, 0, len(order))
+	for _, name := range order {
+		out = append(out, *byFile[name])
+	}
+	return out
+}
+
+// mergeFile weaves one file's chunk findings into a single file review.
+func (a *Agent) mergeFile(ctx context.Context, ref diff.Ref, file string, parts []string) (string, error) {
+	messages := []llm.Message{
+		{Role: "system", Content: a.systemText()},
+		{Role: "user", Content: strings.NewReplacer(
+			"{{file}}", file,
+			"{{findings}}", strings.Join(parts, "\n\n---\n\n"),
+		).Replace(a.filePrompt)},
+	}
+	start := time.Now()
+	xlog.Info("file merge call start",
+		"pr", ref.String(), "file", file, "parts", len(parts),
+		"tokens", sumTokens(parts), "streamed", false)
+	res, err := a.chat(ctx, messages)
+	if err != nil {
+		return "", fmt.Errorf("file %q merge: %w", file, err)
+	}
+	xlog.Info("file merge call complete",
+		"pr", ref.String(), "file", file, "parts", len(parts),
+		"duration_ms", time.Since(start).Milliseconds(),
+		"response_chars", len(res), "response_tokens_est", chunk.EstimateTokens(res))
+	return strings.TrimSpace(res), nil
 }
 
 // reduce consolidates findings into a single review. Non-final levels run
@@ -313,6 +409,7 @@ func (a *Agent) buildMessages(c chunk.Chunk, enrichment string) []llm.Message {
 		"{{index}}", fmt.Sprint(c.Index),
 		"{{total}}", fmt.Sprint(c.Total),
 		"{{files}}", strings.Join(c.Files, ", "),
+		"{{functions}}", strings.Join(c.Functions, ", "),
 		"{{diff}}", c.Text,
 		"{{responseTokens}}", fmt.Sprint(a.maxResponse),
 	)

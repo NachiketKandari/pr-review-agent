@@ -15,15 +15,24 @@ review:
   systemPrompt: |
     You are a senior code reviewer. Focus on correctness, security,
     concurrency, performance, and maintainability.
-  # chunkPrompt supports {{index}} {{total}} {{files}} {{diff}} {{responseTokens}}
+  # chunkPrompt supports {{index}} {{total}} {{files}} {{functions}} {{diff}} {{responseTokens}}
   chunkPrompt: ""
+  # filePrompt weaves one file's chunk findings into a single file review.
+  # Supports {{file}} {{findings}}.
+  filePrompt: ""
   # mergePrompt supports {{findings}}
   mergePrompt: ""
-  maxChunkTokens: 8000
-  maxResponseTokens: 2048
+  # Budgets tuned for a 16K-context model: ~10K input + 4K response + ~2K
+  # headroom for the system prompt and PR intent context.
+  maxChunkTokens: 10000
+  maxResponseTokens: 4000
   temperature: 0.2
 
 # Optional: GitHub access for review mode.
+# Branch review ("source" "target" or "target" for the current branch) never
+# needs a token: it runs git in your terminal, so it authenticates as you
+# (SSH key / credential manager). A token is only a fallback for PR-URL
+# review when no local clone is available.
 # token: API token (config > GITHUB_TOKEN env > gh CLI account > git credentials).
 # diffToken: the ?token= value GitHub puts on shareable .patch/.diff links
 # of private PRs; lets the tool download the PR patch without an API token
