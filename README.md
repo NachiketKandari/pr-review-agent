@@ -61,6 +61,100 @@ line. Surrounding whitespace in the file is trimmed; the file must not be
 empty. If both a message and `-prompt-file` are given, the file wins (a
 warning is logged).
 
+### Explain mode
+
+`-explain` is a separate mode, not a review style. It fetches the change the
+same way a review does — every source below works — and instead of listing
+findings it writes a self-contained interactive HTML page that explains the
+change:
+
+```sh
+go run . -explain "feature/auth" "main"          # explain a branch merge
+go run . -explain "octocat/Hello-World/pull/123" # explain a pull request
+go run . -explain -open "main"                   # ...and open it in a browser
+go run . -explain -output auth.html "fix/login" "main"
+```
+
+The page has four parts, mirroring the
+[explain-diff](https://gist.github.com/ankitg12/8e808d387799de4e9839bc393f8e6405)
+skill: **Background** (the existing system, from a beginner's view and then
+narrowed to the change), **Intuition** (the essence, with a worked toy
+example and diagrams that carry example data), a **code walkthrough** grouped
+by file and function, and a **quiz** of five multiple-choice questions. Click
+an option and the page says whether it was right and why — every option has
+its own explanation, not just the correct one. The page is one file: no
+external CSS, JavaScript, or fonts, so it can be mailed or attached to a PR.
+
+Output goes to `YYYY-MM-DD-<slug>.html` in the current directory, overridable
+with `-output`. The content spec it was rendered from is saved beside it as
+`.spec.json`, so the prose can be edited by hand and re-rendered without
+another model call:
+
+```sh
+go run . -render 2026-10-01-retries-back-off.spec.json -output review.html
+```
+
+`-render` needs no config, no model, and no network.
+
+#### How it fits a 16K context
+
+The skill relies on an agent that can read the repository and hold the whole
+change at once. Neither is available to a CLI with a 16K window, so the same
+recipe becomes the map-reduce flow review already uses:
+
+- **One capped call per chunk.** The diff is split by the same function-aware
+  chunker as review. Each chunk gets one reply, and the reply is a JSON object
+  (`background`, `intuition`, `code`, `callouts`) — never prose, because the
+  pipeline has to stitch many replies together and cannot afford to re-parse
+  it.
+- **Per-section weaving.** Fragments are reduced into one section at a time,
+  recursively while they overflow the budget, so a large change never asks for
+  more context than the window holds. Budgets default to 7000 in / 3000 out,
+  leaving room for the system prompt, the PR intent, and the source context.
+- **Surrounding code is read mechanically, not requested.** The skill tells its
+  agent to "broadly explore the surrounding code". With no tool loop, the
+  explainer instead reads the *pre-image* of the changed files from your local
+  clone (`git show` at the merge base), budget-capped and line-truncated, and
+  tells the model when a file was cut short. With no clone — a `.patch` file
+  or the API route — it says the surrounding source is unavailable, and the
+  model is instructed to describe only what the diff shows rather than invent
+  a caller.
+- **Failures degrade instead of aborting.** Malformed JSON is repaired once
+  (code fences, surrounding prose, trailing commas); a chunk that still fails
+  is dropped with a warning; a quiz that cannot be generated simply is not on
+  the page. A quiz question without exactly one correct option is dropped
+  rather than shown ungradable.
+
+Model-authored markup is sanitized before it reaches the page: script-like
+elements and inline event handlers are stripped, so a diff that happens to
+contain one (a test fixture, a doc example) cannot turn the explanation into
+an active page. Everything else — titles, questions, options, feedback — is
+escaped.
+
+#### Optional explain config
+
+`explain:` is entirely separate from `review:`; the two share no prompts or
+budgets, and enabling `-explain` never changes a review run.
+
+```yaml
+explain:
+  model: deepseek-v4-flash      # optional; else -model, then review.model
+  systemPrompt: ""              # "" = built-in default
+  chunkPrompt: ""               # one chunk of the diff
+  mergePrompt: ""               # weaves one section's fragments
+  quizPrompt: ""                # the closing questions
+  titlePrompt: ""               # the page headline
+  maxChunkTokens: 7000          # input budget per call (16K-tuned)
+  maxResponseTokens: 3000
+  maxQuizTokens: 2000
+  temperature: 0.4              # prose, not analysis
+  sourceMaxFiles: 6             # pre-image files to read
+  sourceMaxTokens: 3000         # total pre-image budget
+```
+
+`-prompt-file` overrides `explain.systemPrompt` in explain mode, exactly as it
+overrides `review.systemPrompt` in review mode.
+
 ### Review mode
 
 #### Branch review (primary form)
@@ -261,8 +355,11 @@ to `review.systemPrompt`, which reliably stops empty responses.
 | `-insecure`    | `false`      | skip TLS certificate verification                      |
 | `-ca`          | empty        | path to a CA bundle file                               |
 | `-timeout`     | config or 2h | request timeout, e.g. `2m`                             |
-| `-output`      | empty        | write the merged review to this file (review mode)     |
-| `-chunk-tokens`| config       | override `review.maxChunkTokens` (review mode)         |
+| `-output`      | empty        | write the merged review to this file (review mode) / the page to this path (explain mode) |
+| `-chunk-tokens`| config       | override the per-call context budget (`review.maxChunkTokens` / `explain.maxChunkTokens`) |
+| `-explain`     | `false`      | write a rich interactive HTML page explaining the change instead of reviewing it |
+| `-open`        | `false`      | open the generated page in a browser (explain mode)    |
+| `-render`      | empty        | re-render a saved `.spec.json` to HTML; no config, model, or network |
 | `-diff`        | empty        | review a local unified diff or .patch file instead of fetching (review mode) |
 | `-diff-token`  | empty        | the ?token= value from a private .patch/.diff link (overrides github.diffToken) |
 | `-repo`        | current dir  | path to a local clone of the repo to diff with git (falls back to API) |
@@ -296,9 +393,10 @@ fatal path logs a structured error with package/PR/chunk context.
 main.go            CLI entry point: chat + review mode, flag wiring
 config/            Continue-style yaml parsing and model selection
 llm/               OpenAI-compatible HTTP client (chat, SSE streaming, models)
-diff/              PR URL parsing, branch review (local git diff), GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing
+diff/              PR URL parsing, branch review (local git diff), GitHub/GitHub Enterprise diff + metadata fetch, unified-diff parsing, pre-image source context
 chunk/             len/4 token estimation, greedy chunk building (file → function → hunk → line)
 review/            map-reduce review agent (prompts, chunk reviews, per-file weave, merges)
+explain/           explain mode: 16K map-reduce page writer, JSON repair, HTML renderer + CSS/JS
 xlog/              slog setup (stderr + JSON file), URL/token redaction
 ```
 
@@ -307,6 +405,10 @@ xlog/              slog setup (stderr + JSON file), URL/token redaction
 - [x] `go run . "source_branch" "target_branch"` to review a branch merge from a local clone (no token needed)
 - [x] `go run . "target_branch"` to review the current branch into the target branch (inside a git clone)
 - [x] `go run . "pr-link"` to fetch a PR diff and review it
+- [x] `-explain` to write a rich interactive HTML explanation of a change
+      (background, intuition, code walkthrough, auto-graded quiz), chunked and
+      budgeted for a 16K context, with the content spec saved for free
+      re-rendering
 - [x] Chunked review of large diffs (function-aware chunking + per-file weave)
 - [x] GitHub Enterprise hosts and read-only PR intent context (title, description, commit messages)
 - [ ] Jira integration: detect the ticket key in the PR title/branch, fetch the

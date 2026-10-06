@@ -180,6 +180,23 @@ func fetchBranch(ctx context.Context, dir, branch string) {
 	xlog.Info("fetched branch from origin", "branch", branch, "dir", dir)
 }
 
+// MergeBase returns the best common ancestor of two refs in the clone at dir
+// — the commit whose tree is the "before" state of a merge, which is what an
+// explanation needs to read the code the change modifies. Callers that only
+// want the pre-image opportunistically should treat an error as "no context
+// available".
+func MergeBase(ctx context.Context, dir, ref1, ref2 string) (string, error) {
+	out, err := gitRun(ctx, dir, "merge-base", ref1, ref2)
+	if err != nil {
+		return "", fmt.Errorf("merge base of %s and %s: %w", ref1, ref2, err)
+	}
+	sha := strings.TrimSpace(out)
+	if sha == "" {
+		return "", fmt.Errorf("no common ancestor of %s and %s", ref1, ref2)
+	}
+	return sha, nil
+}
+
 // resolveBranch resolves a branch name to a concrete ref inside the clone,
 // preferring the remote-tracking ref (origin/<branch>, freshly fetched,
 // which is what a GitHub PR would merge) and falling back to the local
@@ -193,6 +210,27 @@ func resolveBranch(ctx context.Context, dir, branch string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("branch %q not found locally or on origin", branch)
+}
+
+// RepoMergeBase returns the merge base of a pull request's head and base
+// branch in the clone at dir — the commit whose tree is the "before" state of
+// the change. It must be called after [RepoDiff], which fetches the PR head
+// into refs/pr-review/N and the base into refs/remotes/origin/<base>.
+//
+// Explain mode uses it to read the code the PR modifies before it reads the
+// diff, which is the closest thing to "explore the surrounding code" that a
+// pipeline with no tool loop can do.
+func RepoMergeBase(ctx context.Context, dir string, ref Ref) (string, error) {
+	if ref.Number <= 0 {
+		return "", fmt.Errorf("ref %s is not a pull request", ref.String())
+	}
+	branch, err := defaultBranch(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	return MergeBase(ctx, dir,
+		fmt.Sprintf("refs/pr-review/%d", ref.Number),
+		"refs/remotes/origin/"+branch)
 }
 
 // CurrentBranch returns the name of the branch checked out in the clone at

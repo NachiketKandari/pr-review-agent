@@ -4,6 +4,7 @@
 // Chat mode:  go run . "your message" [-flags]
 // Branch review: go run . "source_branch" "target_branch" [-flags]
 // PR review: go run . "https://github.com/owner/repo/pull/N" [-flags]
+// Explain: go run . -explain "source_branch" "target_branch" [-flags]
 //
 // -prompt-file reads the prompt text from a file instead of the command
 // line: it is the chat message in chat mode, and overrides
@@ -14,22 +15,34 @@
 // needed. In review mode the diff is split into chunks, reviewed with a
 // map-reduce flow, and the merged review is streamed to stdout. All logs go
 // to stderr (or the -log-file); stdout carries only the review/chat output.
+//
+// -explain is a separate mode, not a review style: it fetches the change the
+// same way and then writes a self-contained interactive HTML page explaining
+// it — background, intuition, a code walkthrough, and a quiz on the substance
+// — instead of a list of findings. It has its own prompts and its own
+// per-call budgets (explain.* in the config), tuned so nothing exceeds a
+// 16K context window, and it never touches the review path.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/NachiketKandari/pr-review-agent/config"
 	"github.com/NachiketKandari/pr-review-agent/diff"
+	"github.com/NachiketKandari/pr-review-agent/explain"
 	"github.com/NachiketKandari/pr-review-agent/llm"
 	"github.com/NachiketKandari/pr-review-agent/review"
 	"github.com/NachiketKandari/pr-review-agent/xlog"
@@ -52,9 +65,12 @@ func main() {
 	outputPath := flag.String("output", "", "write the review to this file (review mode)")
 	diffPath := flag.String("diff", "", "review a local unified diff file instead of fetching from GitHub")
 	diffToken := flag.String("diff-token", "", "the ?token= value GitHub puts on private .patch/.diff links (overrides github.diffToken)")
-	promptFile := flag.String("prompt-file", "", "read the prompt from this text file (chat mode: the message; review mode: overrides review.systemPrompt)")
+	promptFile := flag.String("prompt-file", "", "read the prompt from this text file (chat mode: the message; review/explain mode: overrides the system prompt)")
+	explainMode := flag.Bool("explain", false, "explain the change as a rich interactive HTML page instead of reviewing it")
+	openPage := flag.Bool("open", false, "open the generated page in a browser (explain mode)")
 	repoDir := flag.String("repo", "", "path to a local clone of the repo; required for branch review, and used to diff PRs with git instead of the API (default: try the current directory)")
-	chunkTokens := flag.Int("chunk-tokens", 0, "override review.maxChunkTokens (review mode)")
+	chunkTokens := flag.Int("chunk-tokens", 0, "override the per-call context budget (review.maxChunkTokens / explain.maxChunkTokens)")
+	renderSpec := flag.String("render", "", "re-render a saved .spec.json to HTML without calling the model")
 	logFile := flag.String("log-file", "", "also append structured JSON logs to this file")
 	debug := flag.Bool("debug", false, "log HTTP-level detail (request URLs, statuses, durations)")
 	quiet := flag.Bool("quiet", false, "log errors and warnings only")
@@ -74,6 +90,13 @@ func main() {
 	defer cleanupLog()
 
 	args := flag.Args()
+	if *renderSpec != "" {
+		// Re-rendering is a pure function of a saved spec: no config, no
+		// model, no network. It runs before the usage check so it works
+		// with no arguments at all.
+		runRender(*renderSpec, *outputPath, *openPage)
+		return
+	}
 	if len(args) == 0 && *diffPath == "" && *promptFile == "" {
 		fmt.Fprintln(os.Stderr, `usage:
   go run . [flags] "source_branch" "target_branch"        review a branch merge
@@ -82,9 +105,14 @@ func main() {
   go run . [flags] "your message"                         chat
   go run . [flags] -prompt-file prompt.txt                chat with a prompt from a file
 
+  -explain writes a rich interactive HTML page explaining the same change
+  instead of reviewing it; it accepts every source above. Add -open to open
+  the page in a browser.
+
   Branch review uses the git auth already in your terminal (SSH key /
   credential manager); it never reads a token from the YAML or env.`)
 		flag.PrintDefaults()
+		usageExamples()
 		os.Exit(2)
 	}
 
@@ -100,6 +128,8 @@ func main() {
 		diffToken:   *diffToken,
 		repoDir:     *repoDir,
 		promptFile:  *promptFile,
+		explainMode: *explainMode,
+		openPage:    *openPage,
 	}
 
 	// A first argument that parses as a GitHub PR URL selects PR review
@@ -108,25 +138,32 @@ func main() {
 	// single branch name inside a git clone reviews the current branch
 	// into that target branch (auth is whatever git itself uses — your
 	// SSH key / credential manager — never a token from the YAML).
-	// -prompt-file supplies the prompt text: the review instructions in
-	// review mode, the chat message otherwise.
+	// -explain swaps the agent, not the input: every one of these sources
+	// feeds the explainer too, so the flag is orthogonal to how the diff
+	// is obtained.
+	// -prompt-file supplies the prompt text: the instructions in
+	// review/explain mode, the chat message otherwise.
+	run := runReview
+	if *explainMode {
+		run = runExplain
+	}
 	if len(args) > 0 {
 		if ref, err := diff.ParseURL(args[0]); err == nil {
-			runReview(flags, ref)
+			run(flags, ref)
 			return
 		}
 		if len(args) >= 2 && !strings.ContainsAny(args[0], " \t") && !strings.ContainsAny(args[1], " \t") {
-			runBranchReview(flags, args[0], args[1])
+			runBranchReview(flags, run, args[0], args[1])
 			return
 		}
 		if len(args) == 1 && !strings.ContainsAny(args[0], " \t") {
 			if source, ok := currentBranchSource(flags.repoDir, args[0]); ok {
-				runBranchReview(flags, source, args[0])
+				runBranchReview(flags, run, source, args[0])
 				return
 			}
 		}
 	} else if *diffPath != "" {
-		runReview(flags, diff.Ref{})
+		run(flags, diff.Ref{})
 		return
 	}
 
@@ -157,6 +194,21 @@ type cfgFlags struct {
 	diffToken   string
 	repoDir     string
 	promptFile  string
+	explainMode bool
+	openPage    bool
+}
+
+// usageExamples prints worked examples of the three review sources and of
+// explain mode, after the flag list.
+func usageExamples() {
+	fmt.Fprint(os.Stderr, `
+examples:
+  go run . "feature/auth" "main"                    review a branch merge
+  go run . -explain -open "feature/auth" "main"     explain it and open the page
+  go run . "octocat/Hello-World/pull/123"           review a pull request
+  go run . -output review.md "my-branch" "main"     also save the review to a file
+  go run . -diff pr-123.patch "octocat/Hello-World/pull/123"
+`)
 }
 
 // readPromptFile reads the prompt text from path. Surrounding whitespace is
@@ -268,19 +320,216 @@ func startReview(f cfgFlags) (*reviewKit, error) {
 // API is not contacted), which works when the org blocks API tokens but
 // git over SSH/credentials is available.
 func runReview(f cfgFlags, ref diff.Ref) {
-	localFile := f.diffPath != ""
-	validRef := ref.Number > 0
-	if localFile {
-		xlog.Info("review mode (local diff)", "diff_file", f.diffPath, "pr", ref.String())
-	} else {
-		xlog.Info("review mode", "pr", ref.GitHubURL())
-	}
-
 	kit, err := startReview(f)
 	if err != nil {
 		fatal(err)
 	}
 	defer kit.stop()
+
+	files, background, repo, detail, _ := fetchChange(kit, f, ref)
+	text, err := kit.agent.Review(kit.ctx, repo, files, background, os.Stdout)
+	if err != nil {
+		fatalAttr("review", &repo, err)
+	}
+	finishReview(f, repo, text, detail...)
+}
+
+// runExplain produces the rich HTML explanation of the same change instead
+// of a review. The diff is fetched by exactly the same route a review uses,
+// so -explain works with every source (branch, PR link, .patch, -diff file)
+// and changes only what is done with it afterwards.
+func runExplain(f cfgFlags, ref diff.Ref) {
+	kit, err := startReview(f)
+	if err != nil {
+		fatal(err)
+	}
+	defer kit.stop()
+
+	files, background, repo, _, src := fetchChange(kit, f, ref)
+	runExplainWith(kit, f, repo, files, background, src)
+}
+
+// runExplainWith renders the explanation for an already-fetched change.
+// src may be nil, in which case the explainer works from the diff alone.
+func runExplainWith(kit *reviewKit, f cfgFlags, repo diff.Ref, files []diff.File, background string, src *explain.Source) {
+	agent, err := explainAgent(kit, f)
+	if err != nil {
+		fatalAttr("explain.agent", &repo, err)
+	}
+	spec, err := agent.Explain(kit.ctx, repo, files, background, src)
+	if err != nil {
+		fatalAttr("explain", &repo, err)
+	}
+	page, err := explain.Render(spec)
+	if err != nil {
+		fatalAttr("explain.render", &repo, err)
+	}
+	path, err := writeExplanation(f, repo, spec, page)
+	if err != nil {
+		fatalAttr("explain.write", &repo, err)
+	}
+	xlog.Info("explanation written", "pr", repo.String(), "path", path,
+		"sections", len(spec.Sections), "quiz_questions", len(spec.Quiz), "bytes", len(page))
+	// stdout carries the artifact path and nothing else; progress went to
+	// stderr as it happened.
+	fmt.Printf("Explained %s -> %s\n", repo.String(), path)
+}
+
+// explainAgent builds the explainer from the same loaded config as the
+// review agent, falling back to review's model choice when explain has none
+// of its own. Only the explain.* keys are read, so a review run is unaffected.
+func explainAgent(kit *reviewKit, f cfgFlags) (*explain.Agent, error) {
+	selector := f.modelSel
+	if selector == "" {
+		selector = kit.cfg.Explain.Model
+	}
+	if selector == "" {
+		selector = kit.cfg.Review.Model
+	}
+	model, err := kit.cfg.Model(selector)
+	if err != nil {
+		return nil, err
+	}
+	xlog.Info("explain model selected", "name", model.Name, "provider", model.Provider, "model", model.Model)
+
+	client, err := llm.New(modelOptions(model, f.insecure, f.caPath, f.timeout))
+	if err != nil {
+		return nil, err
+	}
+
+	systemPrompt := kit.cfg.Explain.SystemPrompt
+	if f.promptFile != "" {
+		text, err := readPromptFile(f.promptFile)
+		if err != nil {
+			return nil, err
+		}
+		systemPrompt = text
+	}
+	maxChunk := kit.cfg.Explain.MaxChunkTokens
+	if f.chunkTokens > 0 {
+		maxChunk = f.chunkTokens
+	}
+	return explain.New(explain.Options{
+		Model:             model.Model,
+		Client:            client,
+		SystemPrompt:      systemPrompt,
+		ChunkPrompt:       kit.cfg.Explain.ChunkPrompt,
+		MergePrompt:       kit.cfg.Explain.MergePrompt,
+		QuizPrompt:        kit.cfg.Explain.QuizPrompt,
+		TitlePrompt:       kit.cfg.Explain.TitlePrompt,
+		MaxChunkTokens:    maxChunk,
+		MaxResponseTokens: kit.cfg.Explain.MaxResponseTokens,
+		MaxQuizTokens:     kit.cfg.Explain.MaxQuizTokens,
+		Temperature:       kit.cfg.Explain.Temperature,
+	})
+}
+
+// writeExplanation saves the page and, next to it, the content spec it was
+// rendered from, so the page can be regenerated or edited without spending
+// another model call. -output overrides the HTML path; the spec always sits
+// beside it.
+func writeExplanation(f cfgFlags, ref diff.Ref, spec explain.Spec, page string) (string, error) {
+	// Normalize before deriving the filename: Render works on its own copy,
+	// so without this the spec saved to disk would keep an empty slug and a
+	// later -render run would not reproduce the same page.
+	spec.Normalize()
+	name := time.Now().Format("2006-01-02") + "-" + spec.Slug
+
+	htmlPath := f.outputPath
+	if htmlPath == "" {
+		htmlPath = filepath.Join(".", name+".html")
+	}
+	if err := os.WriteFile(htmlPath, []byte(page), 0o644); err != nil {
+		return "", fmt.Errorf("write page: %w", err)
+	}
+
+	specJSON, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		xlog.Warn("could not serialize the content spec", "error", err)
+		return htmlPath, nil
+	}
+	specPath := strings.TrimSuffix(htmlPath, filepath.Ext(htmlPath)) + ".spec.json"
+	if err := os.WriteFile(specPath, specJSON, 0o644); err != nil {
+		xlog.Warn("wrote the page but not its content spec", "path", specPath, "error", err)
+	} else {
+		xlog.Info("wrote content spec", "pr", ref.String(), "path", specPath)
+	}
+
+	if f.openPage {
+		openInBrowser(htmlPath)
+	}
+	return htmlPath, nil
+}
+
+// runRender regenerates the HTML page from a saved content spec. This is the
+// equivalent of the skill's render.py, and it is why the spec is written
+// beside every page: the prose can be edited by hand and re-rendered, and a
+// page can be regenerated later without spending a single model call.
+func runRender(specPath, outPath string, open bool) {
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		fatal(fmt.Errorf("read spec %q: %w", specPath, err))
+	}
+	var spec explain.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		fatal(fmt.Errorf("parse spec %q: %w", specPath, err))
+	}
+	page, err := explain.Render(spec)
+	if err != nil {
+		fatal(fmt.Errorf("render spec %q: %w", specPath, err))
+	}
+
+	if outPath == "" {
+		base := strings.TrimSuffix(specPath, filepath.Ext(specPath))
+		if base == specPath {
+			base = specPath + ".html"
+		}
+		outPath = base + ".html"
+	}
+	if err := os.WriteFile(outPath, []byte(page), 0o644); err != nil {
+		fatal(fmt.Errorf("write page: %w", err))
+	}
+	xlog.Info("rendered page from spec", "spec", specPath, "path", outPath, "bytes", len(page))
+	fmt.Printf("Rendered %s -> %s\n", specPath, outPath)
+	if open {
+		openInBrowser(outPath)
+	}
+}
+
+// openInBrowser opens the generated page with the platform's opener. It
+// failing is not worth an error: the path was printed either way.
+func openInBrowser(path string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd, args = "open", []string{path}
+	case "windows":
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", path}
+	default:
+		cmd, args = "xdg-open", []string{path}
+	}
+	if err := exec.Command(cmd, args...).Start(); err != nil {
+		xlog.Warn("could not open a browser", "error", err, "path", path)
+		return
+	}
+	xlog.Info("opened the page in a browser", "path", path)
+}
+
+// fetchChange obtains the diff and its intent context, trying the same routes
+// in the same order a review does: -diff local file, the local git clone, the
+// PR's .patch link, then the GitHub REST API. It is shared by review and
+// explain mode so the two can never disagree about what is being analysed.
+// It returns the parsed files, the intent context, the resolved ref to log
+// under, and log detail about which route was used.
+func fetchChange(kit *reviewKit, f cfgFlags, ref diff.Ref) (files []diff.File, background string, repo diff.Ref, detail []any, src *explain.Source) {
+	localFile := f.diffPath != ""
+	validRef := ref.Number > 0
+	if localFile {
+		xlog.Info("local diff", "diff_file", f.diffPath, "pr", ref.String())
+	} else {
+		xlog.Info("pull request", "pr", ref.GitHubURL())
+	}
 
 	// Fetch the diff. Preferred order: -diff local file, then the local git
 	// clone (run from inside the repo, or point -repo at it) using git's own
@@ -288,6 +537,7 @@ func runReview(f cfgFlags, ref diff.Ref) {
 	// the GitHub REST API.
 	var token string
 	var body []byte
+	var err error
 	gitMeta := diff.Meta{}
 	patchMeta := diff.Meta{}
 	usedGit := false
@@ -323,6 +573,9 @@ func runReview(f cfgFlags, ref diff.Ref) {
 				usedGit = true
 				xlog.Info("using local git clone for the diff (no API token needed)",
 					"pr", ref.String(), "dir", dir, "bytes", len(body))
+				// The clone is right here and holds the code the PR
+				// modifies; remember where, so explain mode can read it.
+				src = clonePreImage(dir, ref, kit.cfg.Explain, kit.ctx)
 			}
 		} else if f.repoDir != "" {
 			fatalAttr("git.repo", &ref, err)
@@ -366,13 +619,12 @@ func runReview(f cfgFlags, ref diff.Ref) {
 			}
 		}
 	}
-	files := parseAndLogDiff(ref, body)
+	files = parseAndLogDiff(ref, body)
 
 	// PR intent context (title, description, commit messages) comes from
 	// git when the clone route was used, from the patch headers when the
 	// .patch route was used, otherwise best-effort from the GitHub API;
 	// the review runs either way.
-	background := ""
 	switch {
 	case usedGit:
 		background = prBackground(gitMeta)
@@ -392,7 +644,7 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		}
 		meta, err := diff.FetchMeta(kit.ctx, ref, token, hc)
 		if err != nil {
-			xlog.Warn("PR metadata unavailable; reviewing the diff only",
+			xlog.Warn("PR metadata unavailable; analysing the diff only",
 				"pr", ref.String(), "error", err)
 		} else {
 			background = prBackground(meta)
@@ -402,23 +654,25 @@ func runReview(f cfgFlags, ref diff.Ref) {
 		}
 	}
 
-	text, err := kit.agent.Review(kit.ctx, ref, files, background, os.Stdout)
-	if err != nil {
-		fatalAttr("review", &ref, err)
-	}
-
-	if validRef {
-		finishReview(f, ref, text, "pr_url", ref.GitHubURL())
-	} else {
-		finishReview(f, ref, text, "diff_file", f.diffPath)
-	}
+	detail = fetchDetail(ref, f, validRef)
+	return files, background, ref, detail, src
 }
 
-// runBranchReview reviews the merge-base diff of merging source into
-// target inside a local git clone (the current directory or -repo). No PR
-// number and no GitHub API call are involved; auth is whatever git itself
-// uses (SSH key / Git Credential Manager).
-func runBranchReview(f cfgFlags, source, target string) {
+// fetchDetail describes which route produced the diff, for the success log.
+func fetchDetail(ref diff.Ref, f cfgFlags, validRef bool) []any {
+	if validRef {
+		return []any{"pr_url", ref.GitHubURL()}
+	}
+	return []any{"diff_file", f.diffPath}
+}
+
+// runBranch reviews (or, with -explain, explains) the merge-base diff of
+// merging source into target inside a local git clone (the current directory
+// or -repo). No PR number and no GitHub API call are involved; auth is
+// whatever git itself uses (SSH key / Git Credential Manager).
+//
+// run is runReview or runExplain: the diff is fetched identically either way.
+func runBranchReview(f cfgFlags, run func(cfgFlags, diff.Ref), source, target string) {
 	kit, err := startReview(f)
 	if err != nil {
 		fatal(err)
@@ -429,28 +683,62 @@ func runBranchReview(f cfgFlags, source, target string) {
 	if dir == "" {
 		dir = "."
 	}
-	xlog.Info("review mode (branches)", "source", source, "target", target, "dir", dir)
+	xlog.Info("branch change", "source", source, "target", target, "dir", dir)
 
-	orepo, err := diff.OriginRepo(kit.ctx, dir)
+	repo, err := diff.OriginRepo(kit.ctx, dir)
 	if err != nil {
-		fatal(fmt.Errorf("branch review needs a local clone of the repository: %w", err))
+		fatal(fmt.Errorf("branch analysis needs a local clone of the repository: %w", err))
 	}
 	body, meta, err := diff.BranchDiff(kit.ctx, dir, source, target)
 	if err != nil {
-		fatalAttr("git.branchdiff", &orepo, err)
+		fatalAttr("git.branchdiff", &repo, err)
 	}
-	files := parseAndLogDiff(orepo, body)
+	files := parseAndLogDiff(repo, body)
 
 	background := prBackground(meta)
-	xlog.Info("gathered context from git", "pr", orepo.String(),
+	xlog.Info("gathered context from git", "pr", repo.String(),
 		"commits", len(meta.Commits), "background_chars", len(background))
 
-	text, err := kit.agent.Review(kit.ctx, orepo, files, background, os.Stdout)
-	if err != nil {
-		fatalAttr("review", &orepo, err)
+	if f.explainMode {
+		// The clone is right here: the merge base of the two branches is
+		// the tree the source branch was written against.
+		rev, err := diff.MergeBase(kit.ctx, dir, source, target)
+		src := &explain.Source{Dir: dir, Rev: rev}
+		if err != nil {
+			xlog.Debug("no merge base for the pre-image; explaining from the diff alone", "error", err)
+			src = nil
+		} else {
+			src.MaxFiles = kit.cfg.Explain.SourceMaxFiles
+			src.MaxTokens = kit.cfg.Explain.SourceMaxTokens
+		}
+		runExplainWith(kit, f, repo, files, background, src)
+		return
 	}
 
-	finishReview(f, orepo, text, "source", source, "target", target)
+	text, err := kit.agent.Review(kit.ctx, repo, files, background, os.Stdout)
+	if err != nil {
+		fatalAttr("review", &repo, err)
+	}
+	finishReview(f, repo, text, "source", source, "target", target)
+}
+
+// clonePreImage locates the commit whose tree holds the code a pull request
+// modifies, so explain mode can read the surrounding code before it reads the
+// diff. It is best effort by design: any failure yields a nil Source, and the
+// explainer then works from the diff alone.
+func clonePreImage(dir string, ref diff.Ref, cfg config.Explain, ctx context.Context) *explain.Source {
+	rev, err := diff.RepoMergeBase(ctx, dir, ref)
+	if err != nil {
+		xlog.Debug("no pre-image for this pull request; explaining from the diff alone",
+			"pr", ref.String(), "error", err)
+		return nil
+	}
+	return &explain.Source{
+		Dir:       dir,
+		Rev:       rev,
+		MaxFiles:  cfg.SourceMaxFiles,
+		MaxTokens: cfg.SourceMaxTokens,
+	}
 }
 
 // currentBranchSource resolves the checked-out branch of the repo at

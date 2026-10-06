@@ -28,6 +28,36 @@ review:
   maxResponseTokens: 4000
   temperature: 0.2
 
+# Optional: explain-mode settings (-explain), for writing a rich interactive
+# HTML page explaining a change instead of reviewing it. Entirely separate
+# from review above: no prompt or budget is shared, so enabling -explain never
+# changes a review run. All keys optional; omitted ones use built-in defaults.
+explain:
+  # model: optional; else the -model flag, then review.model, then the first model
+  systemPrompt: ""
+  # chunkPrompt handles one diff chunk. Supports
+  # {{index}} {{total}} {{files}} {{functions}} {{diff}} {{context}} {{responseTokens}}
+  chunkPrompt: ""
+  # mergePrompt weaves one section's fragments into continuous prose.
+  # Supports {{section}} {{fragments}} {{responseTokens}}.
+  mergePrompt: ""
+  # quizPrompt writes the closing questions. Supports {{page}} {{count}} {{responseTokens}}.
+  quizPrompt: ""
+  # titlePrompt proposes the page headline. Supports {{intent}} {{files}}.
+  titlePrompt: ""
+  # Budgets for a 16K-context model: ~7K input + 3K JSON reply, leaving room
+  # for the system prompt, the PR intent, and the pre-image source context.
+  maxChunkTokens: 7000
+  maxResponseTokens: 3000
+  maxQuizTokens: 2000
+  temperature: 0.4        # prose, not analysis
+  # How much of the surrounding code to read from your local clone before
+  # explaining: the pre-image of the changed files, so the background section
+  # is grounded rather than guessed. Ignored when no clone is available, in
+  # which case the model is told to describe only what the diff shows.
+  sourceMaxFiles: 6
+  sourceMaxTokens: 3000
+
 # Optional: GitHub access for review mode.
 # Branch review ("source" "target" or "target" for the current branch) never
 # needs a token: it runs git in your terminal, so it authenticates as you

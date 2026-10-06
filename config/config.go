@@ -35,6 +35,11 @@ type Config struct {
 	// Review configures pull-request review mode. All fields are optional
 	// and backward compatible; defaults live in the review package.
 	Review Review `yaml:"review"`
+	// Explain configures explain mode (-explain), which renders a rich
+	// HTML walkthrough of a change instead of reviewing it. Defaults live
+	// in the explain package; it has its own prompts and budgets and
+	// shares nothing with Review.
+	Explain Explain `yaml:"explain"`
 	// Github configures GitHub API access. Token is optional; the
 	// GITHUB_TOKEN environment variable is also honored.
 	Github Github `yaml:"github"`
@@ -60,6 +65,25 @@ type Github struct {
 	// downloaded from the web .patch endpoint with it instead of the REST
 	// API, which works when the org blocks API tokens for private repos.
 	DiffToken string `yaml:"diffToken"`
+}
+
+// Explain holds explain-mode settings, for producing a rich interactive HTML
+// explanation of a change instead of a review. Entirely separate from
+// Review: enabling -explain must never change how a plain review behaves, so
+// these prompts and budgets are not shared.
+type Explain struct {
+	Model             string  `yaml:"model"`             // "" = -model flag, then review.model, then first model
+	SystemPrompt      string  `yaml:"systemPrompt"`      // "" = built-in default
+	ChunkPrompt       string  `yaml:"chunkPrompt"`       // "" = built-in default; one chunk of the diff
+	MergePrompt       string  `yaml:"mergePrompt"`       // "" = built-in default; weaves one section
+	QuizPrompt        string  `yaml:"quizPrompt"`        // "" = built-in default; the closing questions
+	TitlePrompt       string  `yaml:"titlePrompt"`       // "" = built-in default; the page headline
+	MaxChunkTokens    int     `yaml:"maxChunkTokens"`    // 0 = 7000 (16K-context tuning)
+	MaxResponseTokens int     `yaml:"maxResponseTokens"` // 0 = 3000
+	MaxQuizTokens     int     `yaml:"maxQuizTokens"`     // 0 = 2000
+	Temperature       float64 `yaml:"temperature"`       // 0 = 0.4
+	SourceMaxFiles    int     `yaml:"sourceMaxFiles"`    // 0 = 6 pre-image files
+	SourceMaxTokens   int     `yaml:"sourceMaxTokens"`   // 0 = 3000 for the pre-image context
 }
 
 func Load(path string) (*Config, error) {
